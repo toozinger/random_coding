@@ -166,6 +166,15 @@ class TransferManager:
         # directory-overview depth (GUI-configurable)
         self.overview_depth = 2
 
+        # overall progress tracking depth (GUI-configurable)
+        self.progress_depth = 2
+
+        # progress tracking
+        self.folders_at_depth_n: list[str] = []  # List of folder keys at depth n
+        self.completed_folders_at_depth_n = 0  # Count of completed folders at depth n
+        self.current_folder_total_files = 0  # Total valid files in current folder
+        self.current_folder_copied_files = 0  # Files copied in current folder
+
         self._init_status_from_file()
 
     # ---------- config ----------
@@ -180,6 +189,10 @@ class TransferManager:
     def set_overview_depth(self, depth: int):
         # Ensure a sane, positive depth
         self.overview_depth = max(1, int(depth))
+
+    def set_progress_depth(self, depth: int):
+        # Ensure a sane, positive depth
+        self.progress_depth = max(1, int(depth))
 
     # ---------- status persistence ----------
 
@@ -217,6 +230,11 @@ class TransferManager:
         self.is_stopped = False
         self.start_time = time.time()
         self.bytes_copied = 0
+        
+        # Reset progress tracking
+        self.completed_folders_at_depth_n = 0
+        self.current_folder_total_files = 0
+        self.current_folder_copied_files = 0
 
         self.msg_queue.put(("log", f"Starting transfer. "
                             f"Source={self.source_dir}, Dest={self.dest_dir}, "
@@ -244,61 +262,53 @@ class TransferManager:
             self._send_directory_overview(src, dst)
             self.msg_queue.put(("log", "Overview built and sent to GUI."))
 
-            # Collect level-1 folders
+            # Count folders at depth n for overall progress
             self.msg_queue.put(
-                ("log", f"Scanning level-1 folders under source: {src}"))
-            level1_dirs = [d for d in safeiterdir(src)
-                           if not self.rule_engine.should_skip_folder(d)]
+                ("log", f"Counting folders at depth {self.progress_depth} for progress tracking..."))
+            self.folders_at_depth_n = self._count_folders_at_depth(src, self.progress_depth)
+            total_folders = len(self.folders_at_depth_n)
             self.msg_queue.put(
-                ("log", f"Found {len(level1_dirs)} level-1 folders."))
+                ("log", f"Found {total_folders} folders at depth {self.progress_depth}."))
+            self.msg_queue.put(("overall_progress_init", {
+                "total": total_folders,
+                "completed": 0
+            }))
 
-            # Process each level-1 folder
-            for idx, l1 in enumerate(level1_dirs, start=1):
+            # Collect top-level folders
+            self.msg_queue.put(
+                ("log", f"Scanning top-level folders under source: {src}"))
+            top_level_dirs = [d for d in safeiterdir(src)
+                              if not self.rule_engine.should_skip_folder(d)]
+            self.msg_queue.put(
+                ("log", f"Found {len(top_level_dirs)} top-level folders."))
+
+            # Process each top-level folder using dynamic level tracking
+            for idx, top_dir in enumerate(top_level_dirs, start=1):
                 if self.is_stopped:
                     self.msg_queue.put(
                         ("log", "Worker detected stop flag. Breaking main loop."))
                     break
 
-                l1_key = l1.relative_to(src).as_posix()
+                top_dir_key = top_dir.relative_to(src).as_posix()
+                current_level = top_dir_key.count('/') + 1
                 self.msg_queue.put(
-                    ("log", f"[L1 {idx}/{len(level1_dirs)}] Considering folder: {l1_key}"))
+                    ("log", f"[Level {current_level} {idx}/{len(top_level_dirs)}] Considering folder: {top_dir_key}"))
 
-                # Level-2 subfolders
-                self.msg_queue.put(
-                    ("log", f"  Scanning level-2 folders in: {l1}"))
-                level2_dirs = [d for d in safeiterdir(l1)
-                               if not self.rule_engine.should_skip_folder(d)]
-                l2_keys = [d.relative_to(src).as_posix() for d in level2_dirs]
-                self.msg_queue.put(
-                    ("log", f"  Found {len(level2_dirs)} level-2 subfolders."))
-                self.msg_queue.put(("l2_for_l1", {
-                    "l1_key": l1_key,
-                    "l2_all": l2_keys,
-                }))
+                # Process this folder and its subdirectories recursively
+                self._process_folder_with_subdirs(top_dir, top_dir_key, src, current_level)
 
-                # Process each level-2 folder recursively
-                for jdx, sub in enumerate(level2_dirs, start=1):
-                    if self.is_stopped:
-                        self.msg_queue.put(
-                            ("log", "  Stop flag seen while processing level-2. Breaking."))
-                        break
-
-                    rel_key = sub.relative_to(src).as_posix()
-                    self.msg_queue.put(
-                        ("log", f"  [L2 {jdx}/{len(level2_dirs)}] Considering folder: {rel_key}"))
-
-                    self._process_folder_recursive(sub, rel_key)
-
-                # Also process files directly under this level-1 folder (non-recursive)
+                # Also process files directly under this folder (non-recursive)
                 if not self.is_stopped:
                     self.msg_queue.put(
-                        ("log", f"  Processing files directly inside L1 folder: {l1_key}"))
-                    self._process_single_folder_files(l1, l1_key)
+                        ("log", f"  Processing files directly inside folder: {top_dir_key}"))
+                    self._process_single_folder_files(top_dir, top_dir_key)
 
-                # Mark this level-1 folder as done if we didn't stop
+                # Mark this folder as done if we didn't stop
                 if not self.is_stopped:
                     # Update destination tree for this completed folder
-                    self._update_dest_tree_for_folder(l1_key)
+                    self._update_dest_tree_for_folder(top_dir_key)
+                    # Update overall progress if this folder is at depth n
+                    self._check_and_update_overall_progress(top_dir_key)
 
             if self.is_stopped:
                 self.msg_queue.put(("stopped", None))
@@ -311,7 +321,122 @@ class TransferManager:
             self.msg_queue.put(("error", f"Fatal error in worker: {e}"))
             self.msg_queue.put(("log", f"Exception in worker: {e!r}"))
 
+    # ---------- progress tracking ----------
+
+    def _count_folders_at_depth(self, root: Path, target_depth: int) -> list[str]:
+        """
+        Count folders at exactly depth n (1-based).
+        Returns a list of folder keys (relative paths).
+        """
+        folders = []
+        
+        def walk(current_path: Path, rel_base: str, current_depth: int):
+            if current_depth > target_depth:
+                return
+            
+            try:
+                for entry in os.scandir(current_path):
+                    if not entry.is_dir(follow_symlinks=False):
+                        continue
+                    
+                    entry_path = Path(entry.path)
+                    if self.rule_engine.should_skip_folder(entry_path):
+                        continue
+                    
+                    if rel_base:
+                        rel = f"{rel_base}/{entry.name}"
+                    else:
+                        rel = entry.name
+                    
+                    # If we're at the target depth, add this folder
+                    if current_depth == target_depth:
+                        folders.append(rel)
+                    else:
+                        # Recurse into subdirectories
+                        walk(entry_path, rel, current_depth + 1)
+            except Exception:
+                pass
+        
+        walk(root, "", 1)
+        return folders
+
+    def _check_and_update_overall_progress(self, folder_key: str):
+        """
+        Check if a completed folder is at depth n, and update overall progress if so.
+        We track any folder at depth n, not just those in the initial count.
+        """
+        depth = folder_key.count('/') + 1
+        if depth == self.progress_depth:
+            # Only count if we haven't already counted this folder
+            is_new_folder = folder_key not in self.folders_at_depth_n
+            if is_new_folder:
+                # Add to list if not already there (in case it was created during processing)
+                self.folders_at_depth_n.append(folder_key)
+            
+            self.completed_folders_at_depth_n += 1
+            total = len(self.folders_at_depth_n)
+            
+            # If it's a new folder, we need to update the maximum, otherwise just update progress
+            if is_new_folder:
+                # Send init to update the maximum, but keep current completed count
+                self.msg_queue.put(("overall_progress_init", {
+                    "total": total,
+                    "completed": self.completed_folders_at_depth_n
+                }))
+            else:
+                # Just update the progress
+                self.msg_queue.put(("overall_progress_update", {
+                    "total": total,
+                    "completed": self.completed_folders_at_depth_n
+                }))
+
     # ---------- scanning and copying ----------
+
+    def _process_folder_with_subdirs(self, folder: Path, folder_key: str, src_root: Path, current_level: int):
+        """
+        Recursively process a folder and its immediate subdirectories.
+        This method handles subdirectories at any level dynamically.
+        
+        Args:
+            folder: The folder path to process
+            folder_key: Relative path key for this folder
+            src_root: Root source directory
+            current_level: Current depth level (1-based)
+        """
+        if self.is_stopped:
+            return
+
+        # Scan immediate subdirectories
+        self.msg_queue.put(
+            ("log", f"  Scanning subdirectories in: {folder_key}"))
+        subdirs = [d for d in safeiterdir(folder)
+                   if not self.rule_engine.should_skip_folder(d)]
+        subdir_keys = [d.relative_to(src_root).as_posix() for d in subdirs]
+        next_level = current_level + 1
+        
+        if len(subdirs) > 0:
+            self.msg_queue.put(
+                ("log", f"  Found {len(subdirs)} subdirectories at level {next_level}."))
+            # Send message about subdirectories found (for GUI tracking)
+            self.msg_queue.put(("subdirs_for_folder", {
+                "folder_key": folder_key,
+                "subdirs": subdir_keys,
+                "level": next_level,
+            }))
+
+        # Process each subdirectory recursively
+        for jdx, subdir in enumerate(subdirs, start=1):
+            if self.is_stopped:
+                self.msg_queue.put(
+                    ("log", f"  Stop flag seen while processing subdirectories. Breaking."))
+                break
+
+            subdir_key = subdir.relative_to(src_root).as_posix()
+            self.msg_queue.put(
+                ("log", f"  [Level {next_level} {jdx}/{len(subdirs)}] Considering folder: {subdir_key}"))
+
+            # Recursively process this subdirectory
+            self._process_folder_recursive(subdir, subdir_key)
 
     def _process_single_folder_files(self, folder: Path, folder_key: str):
         """
@@ -388,6 +513,15 @@ class TransferManager:
             ("folder_files", [p.name for p, _, _ in files_to_copy])
         )
 
+        # Initialize local progress tracking
+        self.current_folder_total_files = len(files_to_copy)
+        self.current_folder_copied_files = 0
+        if self.current_folder_total_files > 0:
+            self.msg_queue.put(("local_progress_init", {
+                "total": self.current_folder_total_files,
+                "copied": 0
+            }))
+
         for src, dst, rel_key in files_to_copy:
             if self.is_stopped:
                 self.msg_queue.put(
@@ -421,6 +555,12 @@ class TransferManager:
                     # Update destination tree incrementally
                     self._add_item_to_dest_tree(rel_key)
                     self._safe_save_status()
+                    # Update local progress
+                    self.current_folder_copied_files += 1
+                    self.msg_queue.put(("local_progress_update", {
+                        "total": self.current_folder_total_files,
+                        "copied": self.current_folder_copied_files
+                    }))
                     copied = True
                     break
                 except Exception as e:
@@ -522,6 +662,15 @@ class TransferManager:
             ("folder_files", [p.name for p, _, _ in files_to_copy])
         )
 
+        # Initialize local progress tracking
+        self.current_folder_total_files = len(files_to_copy)
+        self.current_folder_copied_files = 0
+        if self.current_folder_total_files > 0:
+            self.msg_queue.put(("local_progress_init", {
+                "total": self.current_folder_total_files,
+                "copied": 0
+            }))
+
         for src, dst, rel_key in files_to_copy:
             if self.is_stopped:
                 self.msg_queue.put(
@@ -555,6 +704,12 @@ class TransferManager:
                     # Update destination tree incrementally
                     self._add_item_to_dest_tree(rel_key)
                     self._safe_save_status()
+                    # Update local progress
+                    self.current_folder_copied_files += 1
+                    self.msg_queue.put(("local_progress_update", {
+                        "total": self.current_folder_total_files,
+                        "copied": self.current_folder_copied_files
+                    }))
                     copied = True
                     break
                 except Exception as e:
@@ -575,6 +730,8 @@ class TransferManager:
         self.msg_queue.put(("current_folder_done", folder_key))
         # Update destination tree for this completed folder
         self._update_dest_tree_for_folder(folder_key)
+        # Update overall progress if this folder is at depth n
+        self._check_and_update_overall_progress(folder_key)
 
     def _safe_save_status(self):
         try:
@@ -703,6 +860,8 @@ class TransferGUI:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title("File Transfer (Threaded)")
+        # Set fixed minimum width to prevent bouncing
+        self.root.minsize(width=1200, height=600)
 
         # message queue from worker
         self.msg_queue: queue.Queue = queue.Queue()
@@ -732,6 +891,9 @@ class TransferGUI:
 
         # overview depth
         self.overview_depth_var = tk.IntVar(value=2)
+
+        # overall progress depth
+        self.progress_depth_var = tk.IntVar(value=2)
 
         # UI state caches
         self.current_folder: str = ""
@@ -812,6 +974,22 @@ class TransferGUI:
         depth_spin.pack(side="left", padx=5)
         ttk.Label(depth_frame, text="(applies on next Start)").pack(side="left")
 
+        # Overall progress depth selection
+        progress_depth_frame = ttk.Frame(cfg_frame)
+        progress_depth_frame.grid(row=4, column=0, columnspan=3,
+                                  sticky="w", pady=(5, 0))
+        ttk.Label(progress_depth_frame, text="Overall progress depth:").pack(
+            side="left")
+        progress_depth_spin = ttk.Spinbox(
+            progress_depth_frame,
+            from_=1,
+            to=10,
+            textvariable=self.progress_depth_var,
+            width=5
+        )
+        progress_depth_spin.pack(side="left", padx=5)
+        ttk.Label(progress_depth_frame, text="(applies on next Start)").pack(side="left")
+
         cfg_frame.columnconfigure(1, weight=1)
 
         # === Split main area into left (filesystem view) and right (status/details/log) ===
@@ -874,25 +1052,79 @@ class TransferGUI:
         # Current folder + files + current file
         cur_frame = ttk.LabelFrame(
             right_frame, text="Current folder and file", padding=5)
+        # Set fixed width to prevent column expansion
+        cur_frame.columnconfigure(1, minsize=500)
         cur_frame.grid(row=0, column=0, sticky="nsew")
 
-        ttk.Label(cur_frame, text="Current folder (relative):").grid(
-            row=0, column=0, sticky="w")
+        # Current folder information section
+        folder_info_row = 0
+        
+        ttk.Label(cur_frame, text="Folder (relative):", font=("TkDefaultFont", 9, "bold")).grid(
+            row=folder_info_row, column=0, sticky="w", pady=(0, 2))
         self.current_folder_var = tk.StringVar()
-        ttk.Label(cur_frame, textvariable=self.current_folder_var,
-                  foreground="blue").grid(row=0, column=1, sticky="w")
+        folder_rel_label = ttk.Label(cur_frame, textvariable=self.current_folder_var,
+                  foreground="blue", font=("TkDefaultFont", 9), wraplength=500)
+        folder_rel_label.grid(row=folder_info_row, column=1, sticky="w", pady=(0, 2))
+        
+        folder_info_row += 1
+        ttk.Label(cur_frame, text="Folder (absolute):", font=("TkDefaultFont", 8)).grid(
+            row=folder_info_row, column=0, sticky="w", pady=(0, 2))
+        self.current_folder_abs_var = tk.StringVar()
+        ttk.Label(cur_frame, textvariable=self.current_folder_abs_var,
+                  foreground="darkblue", font=("TkDefaultFont", 8), wraplength=500).grid(
+            row=folder_info_row, column=1, sticky="w", pady=(0, 2))
+        
+        folder_info_row += 1
+        ttk.Label(cur_frame, text="Parent folder:", font=("TkDefaultFont", 8)).grid(
+            row=folder_info_row, column=0, sticky="w", pady=(0, 2))
+        self.current_folder_parent_var = tk.StringVar()
+        ttk.Label(cur_frame, textvariable=self.current_folder_parent_var,
+                  foreground="gray", font=("TkDefaultFont", 8), wraplength=500).grid(
+            row=folder_info_row, column=1, sticky="w", pady=(0, 2))
+        
+        folder_info_row += 1
+        ttk.Label(cur_frame, text="Folder depth:", font=("TkDefaultFont", 8)).grid(
+            row=folder_info_row, column=0, sticky="w", pady=(0, 2))
+        self.current_folder_depth_var = tk.StringVar()
+        ttk.Label(cur_frame, textvariable=self.current_folder_depth_var,
+                  font=("TkDefaultFont", 8)).grid(
+            row=folder_info_row, column=1, sticky="w", pady=(0, 2))
+        
+        folder_info_row += 1
+        ttk.Label(cur_frame, text="Files in folder:", font=("TkDefaultFont", 8)).grid(
+            row=folder_info_row, column=0, sticky="w", pady=(0, 2))
+        self.current_folder_count_var = tk.StringVar()
+        ttk.Label(cur_frame, textvariable=self.current_folder_count_var,
+                  font=("TkDefaultFont", 8)).grid(
+            row=folder_info_row, column=1, sticky="w", pady=(0, 2))
 
-        ttk.Label(cur_frame, text="Files left in folder:").grid(
-            row=1, column=0, sticky="w")
+        folder_info_row += 1
+        ttk.Label(cur_frame, text="Local progress:", font=("TkDefaultFont", 8)).grid(
+            row=folder_info_row, column=0, sticky="w", pady=(5, 2))
+        self.local_progress_var = tk.StringVar(value="0 / 0 files (0%)")
+        ttk.Label(cur_frame, textvariable=self.local_progress_var,
+                  font=("TkDefaultFont", 8)).grid(
+            row=folder_info_row, column=1, sticky="w", pady=(5, 2))
+        
+        folder_info_row += 1
+        self.local_progress_bar = ttk.Progressbar(
+            cur_frame, mode="determinate", length=500
+        )
+        self.local_progress_bar.grid(
+            row=folder_info_row, column=0, columnspan=2, sticky="ew", pady=(0, 5))
+
+        folder_info_row += 1
+        ttk.Label(cur_frame, text="Files remaining:", font=("TkDefaultFont", 8)).grid(
+            row=folder_info_row, column=0, sticky="w", pady=(0, 5))
 
         # Current folder files listbox with scrollbars
         files_frame = ttk.Frame(cur_frame)
-        files_frame.grid(row=2, column=0, columnspan=2, sticky="nsew")
+        files_frame.grid(row=folder_info_row + 1, column=0, columnspan=2, sticky="nsew", pady=(0, 5))
         self.current_folder_files_var = tk.StringVar(value=[])
         self.current_folder_files_lb = tk.Listbox(
             files_frame,
             listvariable=self.current_folder_files_var,
-            height=8, width=60
+            height=6, width=60
         )
         files_vscroll = ttk.Scrollbar(files_frame, orient="vertical",
                                       command=self.current_folder_files_lb.yview)
@@ -908,18 +1140,42 @@ class TransferGUI:
         files_frame.rowconfigure(0, weight=1)
         files_frame.columnconfigure(0, weight=1)
 
-        ttk.Label(cur_frame, text="Current file:").grid(
-            row=3, column=0, sticky="w")
+        # Current file information section
+        file_info_row = folder_info_row + 2
+        ttk.Separator(cur_frame, orient="horizontal").grid(
+            row=file_info_row, column=0, columnspan=2, sticky="ew", pady=5)
+        
+        file_info_row += 1
+        ttk.Label(cur_frame, text="Current file:", font=("TkDefaultFont", 9, "bold")).grid(
+            row=file_info_row, column=0, sticky="w", pady=(0, 2))
         self.current_file_var = tk.StringVar()
         ttk.Label(cur_frame, textvariable=self.current_file_var,
-                  foreground="purple").grid(row=3, column=1, sticky="w")
-
+                  foreground="purple", font=("TkDefaultFont", 9), wraplength=500).grid(
+            row=file_info_row, column=1, sticky="w", pady=(0, 2))
+        
+        file_info_row += 1
+        ttk.Label(cur_frame, text="File path (relative):", font=("TkDefaultFont", 8)).grid(
+            row=file_info_row, column=0, sticky="w", pady=(0, 2))
+        self.current_file_rel_var = tk.StringVar()
+        ttk.Label(cur_frame, textvariable=self.current_file_rel_var,
+                  foreground="darkmagenta", font=("TkDefaultFont", 8), wraplength=500).grid(
+            row=file_info_row, column=1, sticky="w", pady=(0, 2))
+        
+        file_info_row += 1
+        ttk.Label(cur_frame, text="File path (absolute):", font=("TkDefaultFont", 8)).grid(
+            row=file_info_row, column=0, sticky="w", pady=(0, 2))
+        self.current_file_abs_var = tk.StringVar()
+        ttk.Label(cur_frame, textvariable=self.current_file_abs_var,
+                  foreground="darkmagenta", font=("TkDefaultFont", 8), wraplength=500).grid(
+            row=file_info_row, column=1, sticky="w", pady=(0, 2))
+        
+        file_info_row += 1
         self.current_file_size_var = tk.StringVar()
-        ttk.Label(cur_frame, textvariable=self.current_file_size_var).grid(
-            row=4, column=0, columnspan=2, sticky="w"
-        )
+        ttk.Label(cur_frame, textvariable=self.current_file_size_var,
+                  font=("TkDefaultFont", 8)).grid(
+            row=file_info_row, column=0, columnspan=2, sticky="w", pady=(0, 2))
 
-        cur_frame.rowconfigure(2, weight=1)
+        cur_frame.rowconfigure(folder_info_row + 1, weight=1)
         cur_frame.columnconfigure(0, weight=1)
         cur_frame.columnconfigure(1, weight=1)
 
@@ -948,13 +1204,26 @@ class TransferGUI:
         bottom = ttk.Frame(main)
         bottom.grid(row=2, column=0, sticky="ew", pady=(5, 0))
 
+        # Overall progress bar
+        overall_progress_frame = ttk.Frame(bottom)
+        overall_progress_frame.pack(side="left", fill="x", expand=True, padx=(0, 10))
+        ttk.Label(overall_progress_frame, text="Overall progress:", font=("TkDefaultFont", 8)).pack(side="left", padx=(0, 5))
+        self.overall_progress_var = tk.StringVar(value="0 / 0 folders (0%)")
+        ttk.Label(overall_progress_frame, textvariable=self.overall_progress_var,
+                  font=("TkDefaultFont", 8)).pack(side="left", padx=(0, 5))
+        self.overall_progress_bar = ttk.Progressbar(
+            overall_progress_frame, mode="determinate", length=200
+        )
+        self.overall_progress_bar.pack(side="left", fill="x", expand=True)
+
         self.speed_var = tk.StringVar(value="Speed: 0.00 MB/s")
         ttk.Label(bottom, textvariable=self.speed_var).pack(
             side="left", padx=(0, 10))
 
         self.status_var = tk.StringVar(value="")
-        ttk.Label(bottom, textvariable=self.status_var,
-                  foreground="red").pack(side="left")
+        status_label = ttk.Label(bottom, textvariable=self.status_var,
+                  foreground="red", wraplength=400)
+        status_label.pack(side="left")
 
         btn_frame = ttk.Frame(bottom)
         btn_frame.pack(side="right")
@@ -987,6 +1256,7 @@ class TransferGUI:
         dst = data.get("dest_dir", "")
         overwrite = data.get("overwrite", 0)
         depth = data.get("overview_depth", 2)
+        progress_depth = data.get("progress_depth", 2)
         if src:
             self.src_var.set(src)
             self.source_dir = Path(src)
@@ -995,6 +1265,7 @@ class TransferGUI:
             self.dest_dir = Path(dst)
         self.overwrite_var.set(int(overwrite))
         self.overview_depth_var.set(int(depth))
+        self.progress_depth_var.set(int(progress_depth))
 
     def _save_settings(self):
         data = {
@@ -1002,6 +1273,7 @@ class TransferGUI:
             "dest_dir": self.dst_var.get(),
             "overwrite": int(self.overwrite_var.get()),
             "overview_depth": int(self.overview_depth_var.get()),
+            "progress_depth": int(self.progress_depth_var.get()),
         }
         save_json(SETTINGS_FILE, data)
 
@@ -1061,11 +1333,17 @@ class TransferGUI:
         # Clear UI state
         self.status_var.set("")
         self.log_text.delete("1.0", "end")
+        # Reset progress bars
+        self.overall_progress_bar["value"] = 0
+        self.overall_progress_var.set("0 / 0 folders (0%)")
+        self.local_progress_bar["value"] = 0
+        self.local_progress_var.set("0 / 0 files (0%)")
 
         # Configure manager
         self.manager.set_paths(src_path, dst_path)
         self.manager.set_overwrite(bool(self.overwrite_var.get()))
         self.manager.set_overview_depth(self.overview_depth_var.get())
+        self.manager.set_progress_depth(self.progress_depth_var.get())
 
         self.copying = True
         self.start_btn["state"] = "disabled"
@@ -1118,25 +1396,109 @@ class TransferGUI:
         elif cmd == "dest_folder_completed":
             self._update_dest_tree_for_folder(arg)
 
-        elif cmd == "l2_for_l1":
-            l1_key = arg.get("l1_key")
-            l2_all = arg.get("l2_all", [])
-            self._log(f"L1 folder {l1_key} has {len(l2_all)} L2 subfolders.")
+        elif cmd == "subdirs_for_folder":
+            folder_key = arg.get("folder_key")
+            subdirs = arg.get("subdirs", [])
+            level = arg.get("level", 0)
+            self._log(f"Folder {folder_key} (level {level - 1}) has {len(subdirs)} subdirectories at level {level}.")
+
+        elif cmd == "overall_progress_init":
+            total = arg.get("total", 0)
+            completed = arg.get("completed", 0)
+            if total > 0:
+                self.overall_progress_bar["maximum"] = total
+                self.overall_progress_bar["value"] = completed
+                percentage = (completed / total * 100) if total > 0 else 0
+                self.overall_progress_var.set(f"{completed} / {total} folders ({percentage:.1f}%)")
+            else:
+                self.overall_progress_bar["maximum"] = 100
+                self.overall_progress_bar["value"] = 0
+                self.overall_progress_var.set("0 / 0 folders (0%)")
+
+        elif cmd == "overall_progress_update":
+            total = arg.get("total", 0)
+            completed = arg.get("completed", 0)
+            if total > 0:
+                self.overall_progress_bar["maximum"] = total
+                self.overall_progress_bar["value"] = completed
+                percentage = (completed / total * 100) if total > 0 else 0
+                self.overall_progress_var.set(f"{completed} / {total} folders ({percentage:.1f}%)")
+
+        elif cmd == "local_progress_init":
+            total = arg.get("total", 0)
+            copied = arg.get("copied", 0)
+            if total > 0:
+                self.local_progress_bar["maximum"] = total
+                self.local_progress_bar["value"] = copied
+                percentage = (copied / total * 100) if total > 0 else 0
+                self.local_progress_var.set(f"{copied} / {total} files ({percentage:.1f}%)")
+            else:
+                self.local_progress_bar["maximum"] = 100
+                self.local_progress_bar["value"] = 0
+                self.local_progress_var.set("0 / 0 files (0%)")
+
+        elif cmd == "local_progress_update":
+            total = arg.get("total", 0)
+            copied = arg.get("copied", 0)
+            if total > 0:
+                self.local_progress_bar["maximum"] = total
+                self.local_progress_bar["value"] = copied
+                percentage = (copied / total * 100) if total > 0 else 0
+                self.local_progress_var.set(f"{copied} / {total} files ({percentage:.1f}%)")
 
         elif cmd == "current_folder":
             self.current_folder = arg
-            self.current_folder_var.set(arg)
+            self.current_folder_var.set(arg if arg else "(none)")
+            
+            # Calculate folder details
+            if arg and self.source_dir:
+                try:
+                    folder_path = self.source_dir / arg
+                    abs_path = folder_path.resolve()
+                    self.current_folder_abs_var.set(str(abs_path))
+                    
+                    # Calculate parent folder
+                    if arg:
+                        parent_parts = arg.split('/')
+                        if len(parent_parts) > 1:
+                            parent_rel = '/'.join(parent_parts[:-1])
+                            self.current_folder_parent_var.set(parent_rel)
+                        else:
+                            self.current_folder_parent_var.set("(root)")
+                    else:
+                        self.current_folder_parent_var.set("(none)")
+                    
+                    # Calculate depth (number of '/' separators + 1)
+                    depth = arg.count('/') + 1 if arg else 0
+                    self.current_folder_depth_var.set(f"Level {depth}")
+                except Exception:
+                    self.current_folder_abs_var.set("(error)")
+                    self.current_folder_parent_var.set("(error)")
+                    self.current_folder_depth_var.set("(error)")
+            else:
+                self.current_folder_abs_var.set("(none)")
+                self.current_folder_parent_var.set("(none)")
+                self.current_folder_depth_var.set("(none)")
+            
             self.current_folder_files = []
             self.current_folder_files_var.set([])
+            self.current_folder_count_var.set("0 files")
+            # Reset local progress
+            self.local_progress_bar["value"] = 0
+            self.local_progress_var.set("0 / 0 files (0%)")
             self.current_file_rel = ""
             self.current_file_name = ""
             self.current_file_size = 0
             self.current_file_var.set("")
+            self.current_file_rel_var.set("")
+            self.current_file_abs_var.set("")
             self.current_file_size_var.set("")
 
         elif cmd == "folder_files":
             self.current_folder_files = list(arg)
             self.current_folder_files_var.set(self.current_folder_files)
+            file_count = len(self.current_folder_files)
+            self.current_folder_count_var.set(f"{file_count} file{'s' if file_count != 1 else ''}")
 
         elif cmd == "file_start":
             name = arg.get("name", "")
@@ -1146,9 +1508,29 @@ class TransferGUI:
             self.current_file_size = size
             self.current_file_rel = rel
             self.current_file_var.set(name)
-            self.current_file_size_var.set(
-                f"File size: {size / (1024 * 1024):.2f} MB"
-            )
+            self.current_file_rel_var.set(rel if rel else "(none)")
+            
+            # Calculate file details
+            if rel and self.source_dir:
+                try:
+                    file_path = self.source_dir / rel
+                    abs_path = file_path.resolve()
+                    self.current_file_abs_var.set(str(abs_path))
+                except Exception:
+                    self.current_file_abs_var.set("(error)")
+            else:
+                self.current_file_abs_var.set("(none)")
+            
+            # Format file size with appropriate units
+            if size < 1024:
+                size_str = f"{size} bytes"
+            elif size < 1024 * 1024:
+                size_str = f"{size / 1024:.2f} KB"
+            elif size < 1024 * 1024 * 1024:
+                size_str = f"{size / (1024 * 1024):.2f} MB"
+            else:
+                size_str = f"{size / (1024 * 1024 * 1024):.2f} GB"
+            self.current_file_size_var.set(f"File size: {size_str} ({size:,} bytes)")
             self._log(f"Copying: {rel} ({size} bytes)")
 
         elif cmd == "file_copied":
@@ -1157,6 +1539,9 @@ class TransferGUI:
             if base in self.current_folder_files:
                 self.current_folder_files.remove(base)
                 self.current_folder_files_var.set(self.current_folder_files)
+                # Update file count
+                file_count = len(self.current_folder_files)
+                self.current_folder_count_var.set(f"{file_count} file{'s' if file_count != 1 else ''}")
             self._log(f"Copied: {rel}")
 
         elif cmd == "folder_done":
@@ -1166,12 +1551,21 @@ class TransferGUI:
             if self.current_folder == arg:
                 self.current_folder = ""
                 self.current_folder_var.set("")
+                self.current_folder_abs_var.set("")
+                self.current_folder_parent_var.set("")
+                self.current_folder_depth_var.set("")
                 self.current_folder_files = []
                 self.current_folder_files_var.set([])
+                self.current_folder_count_var.set("0 files")
+                # Reset local progress
+                self.local_progress_bar["value"] = 0
+                self.local_progress_var.set("0 / 0 files (0%)")
                 self.current_file_rel = ""
                 self.current_file_name = ""
                 self.current_file_size = 0
                 self.current_file_var.set("")
+                self.current_file_rel_var.set("")
+                self.current_file_abs_var.set("")
                 self.current_file_size_var.set("")
 
         elif cmd == "stopped":
