@@ -1,0 +1,28 @@
+[[source]]
+url = "https://pypi.org/simple"
+verify_ssl = true
+name = "pypi"
+
+[packages]
+spyder = "*"
+tqdm = "*"
+dotenv = "*"
+pywin32 = "*"
+py7zr = "*"
+pyautogui = "*"
+pytesseract = "*"
+scipy = "*"
+easyocr = "*"
+pillow = "*"
+numpy = "*"
+opencv-python = "*"
+matplotlib = "*"
+python-dotenv = "*"
+google-generativeai = "*"
+google-genai = "*"
+keyboard = "*"
+
+[dev-packages]
+
+[requires]
+python_version = "3.12"

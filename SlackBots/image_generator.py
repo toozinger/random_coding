@@ -1,316 +1,304 @@
 import openai
 import requests
-from PIL import Image
 import io
-
 import os
 import logging
 from dotenv import load_dotenv, find_dotenv
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 from slack_sdk import WebClient
-from slack_sdk.errors import SlackApiError
 import concurrent.futures
 import re
 import replicate
+import base64
+from google import genai
+from google.genai import types
+from openai import OpenAI
 
-# %% Setup and tokens
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Load the environment variables from the .env file
+# Load environment variables from .env file
 load_dotenv(find_dotenv(filename="slackbot.env"))
-
-# Get the tokens from the loaded environment variables
-slack_bot_token = os.getenv("SLACK_BOT_TOKEN")
-lunch_app_token = os.getenv("LUNCH_APP_TOKEN")
+image_bot_token = os.getenv("IMAGE_BOT_TOKEN")
+image_app_token = os.getenv("IMAGE_APP_TOKEN")
 openAI_api_key = os.getenv("OPENAI_API_KEY")
 replicate_api_token = os.getenv("REPLICATE_API_TOKEN")
+google_api_key = os.getenv("GOOGLE_API_KEY")
 
-# Initialize slack bot
-client = WebClient(token=slack_bot_token)
+client = WebClient(token=image_bot_token)
+app = App(token=image_bot_token)
 
-# Initialize the Slack app
-app = App(token=slack_bot_token)
-
-# Set OpenAI API key
 openai.api_key = openAI_api_key
-
-# Set Replicate API token in the environment
 os.environ["REPLICATE_API_TOKEN"] = replicate_api_token
-# %% Functions
+
+# --- IMAGE GENERATION PRICING (update as needed) ---
+IMAGE_GEN_PRICING = {
+    "flux": 0.04,    # Price per black-forest-labs / flux-1.1-pro
+    "flux_base": 0.003,  # Price per image using flux schnell
+    "dalle": 0.04,   # Price per HD image 1024x1024 image
+    "gpt": 0.042,    # Price per medium quality 1024x1024 image
+    "gemini": 0.04   # Price per image imagegen 3
+}
 
 
 def make_slack_title_safe(title):
-    # Replace newlines and tabs with spaces
     title = re.sub(r'[\n\t]+', ' ', title)
-
-    # Remove control characters
     title = re.sub(r'[\x00-\x1F\x7F]', '', title)
-
-    # Remove any potential HTML or script tags
     title = re.sub(r'<[^>]*>', '', title)
-
-    # Replace multiple spaces with a single space
     title = re.sub(r'\s+', ' ', title)
-
-    # Trim the title to 1000 characters
     title = title[:1000]
-
-    # Strip leading and trailing whitespace
-    title = title.strip()
-
-    return title
+    return title.strip()
 
 
-def slack_notify(message, channel_id=None, image_url=None, **kwargs):
-    """Send a notification message to a Slack channel using a bot.
-
-    Parameters
-    ----------
-        message (str): The text of the message to send.
-        image_url (list of str): A list of image file paths (optional).
-
-    """
-
+def slack_notify(message, channel_id=None, image_url=None, image_file=None):
     if channel_id is None:
         channel_id = "C07FZ0W13R7"
-
-    logger.debug(f"Slack message: {message}, channel_id: {channel_id}\n"
-                 f"image paths: {image_url}")
-
-    # Send the main text part of the message
     try:
-        logger.info("Attempting to send slack message.")
-        response = client.chat_postMessage(
-            channel=channel_id,
-            text=message
-        )
-        logger.info(f"Slack API Response: {response}")
-        if response["ok"]:
-            logger.debug("Slack message sent successfully.")
-            logger.info(f"Slack message sent:\n{message}")
-        else:
-            logger.warn("Failed to send message.")
+        response = client.chat_postMessage(channel=channel_id, text=message)
     except Exception as e:
         logger.warning(f"Error sending message: {str(e)}")
 
-    # Send each of the images in their own messages
-    if image_url:
+    if image_file:
         try:
-            logger.info(f"Attempting to download image from URL: {image_url}")
-            # Download the image from the URL
+            image_file.seek(0)
+            response = client.files_upload_v2(
+                channel=channel_id,
+                file=image_file,
+                filename="image.png",
+                title="Requested Image"
+            )
+        except Exception as e:
+            logger.warning(f"Error sending image: {str(e)}")
+    elif image_url:
+        try:
             response = requests.get(image_url)
-            response.raise_for_status()  # Raises an HTTPError for bad requests
-            logger.info("Image downloaded successfully.")
-
-            # Get the filename from the URL
+            response.raise_for_status()
             filename = image_url.split('/')[-1]
-            logger.info(f"Extracted filename: {filename}")
-
-            # Create a BytesIO object from the image content
             image_data = io.BytesIO(response.content)
-            logger.info("Created BytesIO object from image content.")
-
-            # Upload the image to Slack
-            logger.info("Attempting to upload image to Slack.")
             response = client.files_upload_v2(
                 channel=channel_id,
                 file=image_data,
                 filename=filename,
-                title=make_slack_title_safe(message)
+                title="Requested Image"
             )
-            logger.info(f"Slack File Upload API Response: {response}")
-
-            if response["ok"]:
-                logger.info("Slack message with image sent successfully")
-            else:
-                logger.warning("Failed to send slack message with image.")
-        except requests.RequestException as e:
-            logger.warning(f"Error downloading image from URL: {str(e)}")
-        except SlackApiError as e:
-            logger.warning(f"Error sending image: {e.response['error']}")
         except Exception as e:
-            logger.warning(f"Error: {str(e)}")
+            logger.warning(f"Error downloading or sending image: {str(e)}")
 
-# %% image generator
+
+def pre_process(prompt):
+    try:
+
+        client = OpenAI(api_key=openAI_api_key)
+        response = client.chat.completions.create(
+            model="gpt-4.1-mini",
+            messages=[
+                {"role":
+                 "system",
+                 "content": "You are a helpful assistant that improves image "
+                 "generation prompts. Only output the improved prompt."},
+                {"role":
+                 "user",
+                 "content": f"Improve this image generation prompt. "
+                 "RETAIN all information regarding the prompt:\n"
+                 f"{prompt}\nONLY output the improved prompt."}
+            ]
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        logger.error(f"Prompt preprocessing error: {e}")
+        return prompt
 
 
 class ImageGenerator:
     def __init__(self):
-
         self.raw_prompt = None
         self.preprocessed_prompt = None
-        openai.api_key = openAI_api_key
-        logger.info("ImageGenerator initialized.")
-
-    import openai
 
     def preprocess_prompt(self, prompt):
-        logger.info(f"Preprocessing prompt: {prompt}")
         self.raw_prompt = prompt
-        try:
-            logger.info("Calling OpenAI ChatCompletion API...")
-            client = openai.OpenAI()  # Create an OpenAI client
-            response = client.chat.completions.create(  # Use client.chat.completions.create
-                model="gpt-4o",
-                messages=[
-                    {"role": "system",
-                     "content": "You are a helpful assistant that improves image generation prompts."},
-                    {"role": "user",
-                     "content": f"Improve this image generation prompt. RETAIN all information regarding:"
-                     f"{prompt}.\n"
-                     f"ONLY output the improved prompt."}
-                ]
-            )
-            logger.info(f"OpenAI API Response: {response}")
-            processed_response = response.choices[0].message.content.strip()
+        processed = pre_process(prompt)
+        self.preprocessed_prompt = processed
+        return processed is not None
 
-            if "denied" not in processed_response.lower():
-                logger.info(f"Prompt input: '{prompt}'\n"
-                            # Changed logging level from warning to info
-                            f"Modified prompt: '{processed_response}'")
-                self.preprocessed_prompt = processed_response
-                logger.info(f"Preprocessed prompt successfully: {
-                            self.preprocessed_prompt}")
-                return True
-            else:
-                logging.warning("Failed to preprocess prompt")
-                return False
-        except Exception as e:
-            logger.error(f"Error in preprocess_prompt: {e}")
-            return False
+    def generate_image(self, model="flux_base"):
+        prompt = self.preprocessed_prompt
+        if not prompt:
+            logger.warning("Prompt not preprocessed!")
+            return None
 
-    def generate_image(self, model="flux"):
-
-        if self.preprocessed_prompt is None:
-            logging.warning("Must pre-process prompt first")
-            return
-
-        logger.info("Processing image prompt...")
-
-        if "flux" in model:
-
-            replicate_api = replicate.Client(
-                api_token=os.environ["REPLICATE_API_TOKEN"])
-
-            logger.info("Calling Replicate API...")
+        if model == "flux_base":
             try:
+                replicate_api = replicate.Client(
+                    api_token=os.environ["REPLICATE_API_TOKEN"])
                 output = replicate_api.run(
                     "black-forest-labs/flux-schnell",
                     input={
-                        "prompt": self.preprocessed_prompt,
+                        "prompt": prompt,
                         "num_outputs": 1,
                         "aspect_ratio": "16:9",
                         "output_format": "png",
                         "output_quality": 90
                     }
                 )
-                logger.info(f"Replicate API Output: {output}")
-
-                # image_url = output[0]
-                # logger.info(f"Image URL from Replicate: {image_url}")
-                image_url = str(output[0])  # convert FileOutput to a string
-                logger.info(f"Image URL from Replicate: {image_url}")
-
+                return {"type": "url", "data": str(output[0])}
             except Exception as e:
-                logger.error(f"Error in Replicate API call: {e}")
+                logger.error(f"Flux-Schnell image error: {e}")
                 return None
 
-        elif "dalle" in model:
-
-            logger.info("Calling OpenAI Image API (DALL-E)...")
+        elif model == "flux":
             try:
-                res = openai.images.generate(  # Use client.images.generate
+                replicate_api = replicate.Client(
+                    api_token=os.environ["REPLICATE_API_TOKEN"])
+                output = replicate_api.run(
+                    "black-forest-labs/flux-1.1-pro",
+                    input={
+                        "prompt": prompt,
+                        "num_outputs": 1,
+                        "aspect_ratio": "16:9",
+                        "output_format": "png",
+                        "output_quality": 90
+                    }
+                )
+                return {"type": "url", "data": str(output)}
+            except Exception as e:
+                logger.error(f"Flux image error: {e}")
+                return None
+
+        elif model == "dalle":
+            try:
+                response = openai.images.generate(
                     model="dall-e-3",
-                    prompt=self.preprocessed_prompt,
+                    prompt=prompt,
                     n=1,
                 )
-                logger.info(f"OpenAI Image API Response: {res}")
-                image_url = res.data[0].url
-                logger.info(f"Image URL from DALL-E: {image_url}")
+                return {"type": "url", "data": response.data[0].url}
             except Exception as e:
-                logger.error(f"Error in OpenAI Image API call: {e}")
+                logger.error(f"DALL-E image error: {e}")
                 return None
 
-        logger.info(f"Image generated, url: {image_url}")
-        return image_url
+        elif model == "gpt":
+            try:
+                client = OpenAI(api_key=openAI_api_key)
+                result = client.images.generate(
+                    model="gpt-image-1",
+                    prompt=prompt,
+                    n=1,
+                    quality="medium",
+                    size="1024x1024",
 
-    def display_image(self, url):
-        try:
-            response = requests.get(url)
-            response.raise_for_status()
-            image_data = io.BytesIO(response.content)
-            image = Image.open(image_data)
-            image.show()
+                )
+                image_base64 = result.data[0].b64_json
+                image_bytes = base64.b64decode(image_base64)
+                image_io = io.BytesIO(image_bytes)
+                return {"type": "file", "data": image_io}
+            except Exception as e:
+                logger.error(f"GPT image error: {e}")
+                return None
 
-            logging.warning("Image displayed")
-        except Exception as e:
-            logger.error(f"Error displaying image: {e}")
+        elif model == "gemini":
+            try:
+                client = genai.Client(api_key=google_api_key)
+                response = client.models.generate_images(
+                    model='imagen-3.0-generate-002',
+                    prompt=prompt,
+                )
+                generated_image = response.generated_images[0]
+                image_bytes = generated_image.image.image_bytes  # <--- Here!
 
-# %% /Lunch callback functions
+                image_io = io.BytesIO(image_bytes)
+                return {"type": "file", "data": image_io}
+            except Exception as e:
+                logger.error(f"Gemini image error: {e}")
+                return None
 
 
-def lunch_callback(user_input, channel_id):
-    logger.info("Running lunch callback")
+# --- CHANGED! Detect -gpt, -dalle, -flux ---
 
+
+def parse_image_command(text):
+    lowered = text.lower()
+    method = "flux_base"  # use new default!
+    # Check for -gpt, -dalle, -flux, -flux_base, -schnell, -gemini flag
+    if "-gpt" in lowered:
+        method = "gpt"
+        prompt = re.sub(r"-gpt\b", "", text, flags=re.IGNORECASE).strip()
+    elif "-dalle" in lowered:
+        method = "dalle"
+        prompt = re.sub(r"-dalle\b", "", text, flags=re.IGNORECASE).strip()
+    elif "-flux_base" in lowered or "-schnell" in lowered:
+        # both explicitly select default
+        method = "flux_base"
+        prompt = re.sub(r"-(flux_base|schnell)\b", "",
+                        text, flags=re.IGNORECASE).strip()
+    elif "-flux" in lowered:
+        method = "flux"   # pro, not default!
+        prompt = re.sub(r"-flux\b", "", text, flags=re.IGNORECASE).strip()
+    elif "-gemini" in lowered:
+        method = "gemini"
+        prompt = re.sub(r"-gemini\b", "", text, flags=re.IGNORECASE).strip()
+    else:
+        prompt = text.strip()
+    return method, prompt
+
+
+# --- CHANGED: Make requestor mentionable ---
+
+
+def image_callback(user_input, channel_id, user_id):  # NEW param
+    model, prompt = parse_image_command(user_input)
+    logger.info(f"Image requested with model: {model}")
+
+    # 1. Lookup cost-per-image for model
+    cost = IMAGE_GEN_PRICING.get(model, 0.00)
     generator = ImageGenerator()
-
-    success = generator.preprocess_prompt(user_input)
-
-    logger.info(f"Preprocess prompt returned: {success}")
-
-    if not success:
-        logger.info("Prompt preprocessing failed.")
-        slack_notify("Unable to generate request",
-                     channel_id=channel_id)
+    preprocess_success = generator.preprocess_prompt(prompt)
+    if not preprocess_success:
+        slack_notify(
+            f"<@{user_id}> Unable to preprocess prompt.", channel_id)
         return
 
-    logger.info("Prompt preprocessing succeeded.")
+    result = generator.generate_image(model=model)
+    if not result:
+        slack_notify(f"<@{user_id}> Failed to generate image.", channel_id)
+        return
 
-    if "dalle" in user_input.lower():
-        model = "dalle"
-    elif "flux" in user_input.lower():
-        model = "flux"
-    else:
-        model = "flux"
+    requester = f"<@{user_id}>"
+    message = (f"{generator.preprocessed_prompt}\n"
+               f"*Requested by {requester}*\n"
+               f"Model: `{model}`. Estimated cost: `${cost:.3f}`")
 
-    image_url = generator.generate_image(model=model)
-
-    if image_url:
-        slack_notify(f"{generator.preprocessed_prompt}",
-                     channel_id=channel_id,
-                     image_url=image_url)
-    else:
-        slack_notify("Failed to generate image.", channel_id=channel_id)
+    if result["type"] == "url":
+        slack_notify(message, channel_id, image_url=result["data"])
+    elif result["type"] == "file":
+        slack_notify(message, channel_id, image_file=result["data"])
 
 
-@app.command("/lunch")
-def handle_plot_command(ack, command, say):
+# --- Slack handler ---
+
+
+@app.command("/image")
+def handle_image_command(ack, command, say):
     ack()
-
-    logger.info("Received /lunch command")
     try:
         user_input = command['text']
         channel_id = command['channel_id']
-        logger.info(f"Lunch request received. Processing")
-        say(f"You requested image with prompt: '{user_input}'. "
-            "Processing your request")
-
+        user_id = command['user_id']  # NEW
+        requester = f"<@{user_id}>"
+        say(f"{requester} requested image with prompt: "
+            f"'/image {user_input}'. Processing your request...")
         with concurrent.futures.ThreadPoolExecutor() as executor:
-            future = executor.submit(lunch_callback, user_input, channel_id)
+            future = executor.submit(
+                image_callback, user_input, channel_id, user_id)
             future.add_done_callback(
-                lambda x: logger.info("Plotter callback completed")
-            )
+                lambda x: logger.info("Image callback completed"))
     except Exception as e:
         logger.error(f"Error handling command: {str(e)}")
         say("Sorry, an error occurred while processing your command.")
 
 
-# Usage example:
 if __name__ == "__main__":
-
-    handler = SocketModeHandler(app, lunch_app_token)
+    handler = SocketModeHandler(app, image_app_token)
     logger.info("Starting the app...")
     handler.start()
