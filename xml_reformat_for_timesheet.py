@@ -4,9 +4,14 @@ import os
 def convert_timesheet_xml(input_path):
     DEFAULT_USER_ID = "n7r17k0frHRMyAkHpQPQQZW9cjg1"
     
+    # Split the directory from the filename
     file_dir, file_name = os.path.split(input_path)
-    output_path = os.path.join(file_dir, f"CONVERTED_{file_name}")
-
+    
+    # Split the filename into name and extension (e.g., "data" and ".xml")
+    name, ext = os.path.splitext(file_name)
+    
+    # Reconstruct the path: directory/name_CONVERTED.extension
+    output_path = os.path.join(file_dir, f"{name}_CONVERTED{ext}")
     try:
         tree = ET.parse(input_path)
         old_root = tree.getroot()
