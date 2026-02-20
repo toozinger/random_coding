@@ -13,17 +13,17 @@ import piexif
 import queue
 
 class ImageTask:
-    def __init__(self, file_path, output_folder, folder_path, y, m, d, description):
+    def __init__(self, file_path, output_folder, folder_path, y, m, d, description, rotation):
         self.file_path = file_path
         self.output_folder = output_folder
         self.folder_path = folder_path
         self.base_name, self.ext = os.path.splitext(os.path.basename(file_path))
         self.y, self.m, self.d = y, m, d
         self.description = description
+        self.rotation = rotation  # The rotation angle to apply permanently
         self.new_webp_name = self.base_name + ".webp"
 
 class ProcessorThread(QThread):
-    # Signal to communicate back to the GUI thread
     log_signal = pyqtSignal(str)
 
     def __init__(self):
@@ -45,7 +45,12 @@ class ProcessorThread(QThread):
     def process_image(self, task):
         try:
             img = Image.open(task.file_path)
+            # Normalize orientation based on existing EXIF first
             img = ImageOps.exif_transpose(img)
+            
+            # Apply requested manual rotation (PIL uses counter-clockwise)
+            if task.rotation != 0:
+                img = img.rotate(task.rotation, expand=True)
             
             exif_dict = {"0th": {}, "Exif": {}, "1st": {}, "thumbnail": None, "GPS": {}}
             exif_date = f"{task.y if task.y else '1900'}:{task.m.zfill(2) if task.m else '01'}:{task.d.zfill(2) if task.d else '01'} 12:00:00"
@@ -60,7 +65,7 @@ class ProcessorThread(QThread):
             # Save Lossless
             new_webp_path = os.path.join(task.folder_path, task.new_webp_name)
             img.save(new_webp_path, "WEBP", lossless=True, method=6, exif=exif_bytes)
-            self.log_signal.emit(f"SAVED (Lossless): {task.new_webp_name} to root")
+            self.log_signal.emit(f"SAVED (Lossless): {task.new_webp_name}")
 
             # Save Lossy
             lossy_path = os.path.join(task.output_folder, task.new_webp_name)
@@ -138,9 +143,10 @@ class ImageDescriber(QWidget):
         self.folder_path = self.load_last_path()
         self.files = []
         self.current_index = 0
+        self.current_rotation = 0 # Track rotation for PIL processing
 
         self.processor = ProcessorThread()
-        self.processor.log_signal.connect(self.update_console) # Connect logger
+        self.processor.log_signal.connect(self.update_console)
         self.processor.start()
 
         self.initUI()
@@ -181,6 +187,19 @@ class ImageDescriber(QWidget):
         for w in [self.year_input, self.month_input, self.day_input]:
             w.setFixedWidth(80)
             date_group.addWidget(w)
+        
+        # Rotation Buttons
+        self.rot_left_btn = QPushButton("⟲ Rotate Left")
+        self.rot_right_btn = QPushButton("⟳ Rotate Right")
+        self.rot_left_btn.setFixedWidth(120)
+        self.rot_right_btn.setFixedWidth(120)
+        self.rot_left_btn.clicked.connect(lambda: self.rotate_image(90))
+        self.rot_right_btn.clicked.connect(lambda: self.rotate_image(-90))
+        
+        date_group.addSpacing(20)
+        date_group.addWidget(self.rot_left_btn)
+        date_group.addWidget(self.rot_right_btn)
+        
         date_group.addStretch()
         self.main_layout.addLayout(date_group)
 
@@ -208,7 +227,7 @@ class ImageDescriber(QWidget):
         self.next_btn.clicked.connect(self.process_and_next)
         self.main_layout.addLayout(nav)
 
-        # Console (Logger) - Fixed height ~4 lines
+        # Console
         self.console = QPlainTextEdit()
         self.console.setReadOnly(True)
         self.console.setFixedHeight(80) 
@@ -219,9 +238,15 @@ class ImageDescriber(QWidget):
         self.setLayout(self.main_layout)
         self.desc_input.returnPressed.connect(self.process_and_next)
 
+    def rotate_image(self, angle):
+        """Rotate visually in the viewer and track the total angle for PIL."""
+        # angle is positive for CCW (Left) and negative for CW (Right)
+        # PIL also uses positive CCW, so this maps perfectly.
+        self.current_rotation = (self.current_rotation + angle) % 360
+        self.viewer.rotate(-angle) # QGraphicsView.rotate uses Clockwise as positive
+
     def update_console(self, message):
         self.console.appendPlainText(message)
-        # Auto-scroll to bottom
         self.console.verticalScrollBar().setValue(self.console.verticalScrollBar().maximum())
 
     def load_last_path(self):
@@ -254,6 +279,9 @@ class ImageDescriber(QWidget):
         self.load_image()
 
     def load_image(self):
+        self.current_rotation = 0 
+        self.viewer.resetTransform() 
+        
         if not self.files or self.current_index >= len(self.files):
             self.viewer.setPhoto(None)
             self.progress_label.setText("Done!")
@@ -263,28 +291,50 @@ class ImageDescriber(QWidget):
         filename = self.files[self.current_index]
         self.progress_label.setText(f"Image {self.current_index + 1} of {len(self.files)}")
         self.file_info_label.setText(f"File: {filename}")
+        
+        # Always clear description for a new image
         self.desc_input.clear()
+    
+        img_path = os.path.join(self.folder_path, filename)
+        img = Image.open(img_path)
+        exif_data = img.info.get("exif")
+        
+        # Check processed folder if root file has no exif
+        if not exif_data:
+            base_name, _ = os.path.splitext(filename)
+            for ext in ['.webp', '.jpg', '.jpeg']:
+                processed_path = os.path.join(self.output_folder, base_name + ext)
+                if os.path.exists(processed_path):
+                    with Image.open(processed_path) as p_img:
+                        exif_data = p_img.info.get("exif")
+                        if exif_data: break
 
-        try:
-            img_path = os.path.join(self.folder_path, filename)
-            img = Image.open(img_path)
-            if "exif" in img.info:
-                exif = piexif.load(img.info["exif"])
-                dt = exif.get("Exif", {}).get(piexif.ExifIFD.DateTimeOriginal)
-                if dt:
+        if exif_data:
+            # Metadata found: Overwrite inputs with file data
+            exif = piexif.load(exif_data)
+            dt = exif.get("Exif", {}).get(piexif.ExifIFD.DateTimeOriginal)
+            if dt:
+                try:
                     y, m, d = dt.decode().split(' ')[0].split(':')
                     self.year_input.setText(y)
                     self.month_input.setText(m)
                     self.day_input.setText(d)
+                except: pass
+            else:
+                # If file has exif but no date, keep the previous date
+                pass
 
-                desc = exif.get("0th", {}).get(piexif.ImageIFD.ImageDescription)
-                if desc:
-                    self.desc_input.setText(desc.decode('utf-8'))
-            img.close()
-            self.viewer.setPhoto(QPixmap(img_path))
-        except Exception as e:
-            self.update_console(f"Load error: {e}")
+            desc = exif.get("0th", {}).get(piexif.ImageIFD.ImageDescription)
+            if desc:
+                self.desc_input.setText(desc.decode('utf-8'))
+        else:
+            # No metadata found at all: keep prev_y, prev_m, prev_d in the inputs
+            # (Logic: We don't call .clear() on date inputs here)
+            pass
         
+        img.close()
+        self.viewer.setPhoto(QPixmap(img_path))
+
         self.desc_input.setFocus()
 
     def process_and_next(self):
@@ -298,7 +348,8 @@ class ImageDescriber(QWidget):
             y=self.year_input.text(),
             m=self.month_input.text(),
             d=self.day_input.text(),
-            description=self.desc_input.text().strip()
+            description=self.desc_input.text().strip(),
+            rotation=self.current_rotation # Pass the rotation to the worker
         )
 
         self.files[self.current_index] = task.new_webp_name
@@ -317,16 +368,31 @@ class ImageDescriber(QWidget):
             self.load_image()
 
     def fast_forward(self):
-        for i in range(self.current_index, len(self.files)):
-            filename = self.files[i]
-            base_name, _ = os.path.splitext(filename)
-            if os.path.exists(os.path.join(self.output_folder, base_name + ".webp")):
-                continue
-            self.current_index = i
-            break
-        else:
-            self.current_index = len(self.files)
-        self.load_image()
+            # Define extensions to check for in the output folder
+            valid_exts = ('.jpg', '.jpeg', '.tiff', '.bmp', '.png', '.webp')
+            
+            for i in range(self.current_index, len(self.files)):
+                filename = self.files[i]
+                base_name, _ = os.path.splitext(filename)
+                
+                # Check if any version of this file exists in the processed folder
+                already_processed = False
+                for ext in valid_exts:
+                    if os.path.exists(os.path.join(self.output_folder, base_name + ext)):
+                        already_processed = True
+                        break
+                
+                if already_processed:
+                    continue
+                    
+                # If we find a file that hasn't been processed yet, stop here
+                self.current_index = i
+                break
+            else:
+                # If all remaining files were processed, go to the end
+                self.current_index = len(self.files)
+                
+            self.load_image()
 
     def resizeEvent(self, event):
         self.viewer.fitInView()
