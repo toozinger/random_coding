@@ -4,22 +4,82 @@ import yaml
 from pathlib import Path
 from platformdirs import user_config_dir
 from PyQt5.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout,
-                             QLabel, QLineEdit, QPushButton, QFileDialog)
-from PyQt5.QtGui import QPixmap
-from PyQt5.QtCore import Qt
-from PIL import Image
+                             QLabel, QLineEdit, QPushButton, QFileDialog, 
+                             QGraphicsView, QGraphicsScene, QFrame)
+from PyQt5.QtGui import QPixmap, QPainter, QImageReader
+from PyQt5.QtCore import Qt, QRectF
+from PIL import Image, ImageOps
 import piexif
 import piexif.helper
+
+class PhotoViewer(QGraphicsView):
+    """A custom graphics view for zooming and panning."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._zoom = 0
+        self._empty = True
+        self._scene = QGraphicsScene(self)
+        self._photo = self._scene.addPixmap(QPixmap())
+        self.setScene(self._scene)
+        self.setTransformationAnchor(QGraphicsView.AnchorUnderMouse)
+        self.setResizeAnchor(QGraphicsView.AnchorUnderMouse)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.setBackgroundBrush(Qt.black)
+        self.setFrameShape(QFrame.NoFrame)
+
+    def hasPhoto(self):
+        return not self._empty
+
+    def setPhoto(self, pixmap=None):
+        self._zoom = 0
+        if pixmap and not pixmap.isNull():
+            self._empty = False
+            self.setDragMode(QGraphicsView.ScrollHandDrag)
+            self._photo.setPixmap(pixmap)
+        else:
+            self._empty = True
+            self.setDragMode(QGraphicsView.NoDrag)
+            self._photo.setPixmap(QPixmap())
+        self.fitInView()
+
+    def fitInView(self, scale=True):
+        rect = QRectF(self._photo.pixmap().rect())
+        if not rect.isNull():
+            self.setSceneRect(rect)
+            if self.hasPhoto():
+                unity = self.transform().mapRect(QRectF(0, 0, 1, 1))
+                self.scale(1 / unity.width(), 1 / unity.height())
+                viewrect = self.viewport().rect()
+                scenerect = self.transform().mapRect(rect)
+                factor = min(viewrect.width() / scenerect.width(),
+                             viewrect.height() / scenerect.height())
+                self.scale(factor, factor)
+            self._zoom = 0
+
+    def wheelEvent(self, event):
+        if self.hasPhoto():
+            if event.angleDelta().y() > 0:
+                factor = 1.25
+                self._zoom += 1
+            else:
+                factor = 0.8
+                self._zoom -= 1
+            
+            if self._zoom > 0:
+                self.scale(factor, factor)
+            elif self._zoom == 0:
+                self.fitInView()
+            else:
+                self._zoom = 0
 
 class ImageDescriber(QWidget):
     def __init__(self):
         super().__init__()
         
-        # Setup Config Path
         self.config_dir = Path(user_config_dir("PythonTools", "meta_data_modify"))
         self.config_file = self.config_dir / "persistence.yaml"
         
-        # Default state
         self.folder_path = self.load_last_path()
         self.files = []
         self.current_index = 0
@@ -31,12 +91,11 @@ class ImageDescriber(QWidget):
             self.scan_folder(self.folder_path)
 
     def initUI(self):
-        self.setWindowTitle('Photo Metadata Tagger')
-        self.setGeometry(100, 100, 900, 900)
-
+        self.setWindowTitle('Photo Metadata Tagger (Zoom & Pan enabled)')
+        self.setGeometry(100, 100, 1000, 900)
         self.main_layout = QVBoxLayout()
 
-        # --- Top Bar: Folder Selection ---
+        # Top Controls
         self.top_layout = QHBoxLayout()
         self.path_label = QLabel(self.folder_path if self.folder_path else "No folder selected")
         self.path_label.setStyleSheet("color: #666; font-style: italic;")
@@ -46,80 +105,62 @@ class ImageDescriber(QWidget):
         self.top_layout.addWidget(self.browse_btn)
         self.main_layout.addLayout(self.top_layout)
 
-        # Progress Label
         self.progress_label = QLabel("Please select a folder to begin")
         self.main_layout.addWidget(self.progress_label)
 
-        # Image Preview
-        self.image_label = QLabel("No Image Loaded")
-        self.image_label.setAlignment(Qt.AlignCenter)
-        self.image_label.setMinimumSize(600, 450)
-        self.image_label.setScaledContents(False) 
-        self.main_layout.addWidget(self.image_label)
+        # Dynamic Image Viewer
+        self.viewer = PhotoViewer(self)
+        self.main_layout.addWidget(self.viewer, 1) # Factor 1 allows it to expand
 
-        # Filename Label
         self.file_info_label = QLabel("")
         self.file_info_label.setAlignment(Qt.AlignCenter)
         self.file_info_label.setStyleSheet("font-weight: bold; color: #555; font-size: 14px;")
         self.main_layout.addWidget(self.file_info_label)
 
-        # --- Date Input Section ---
+        # Date and Description Inputs
         date_section_layout = QVBoxLayout()
-        date_label = QLabel("Date Taken (Year / Month / Day):")
-        date_label.setStyleSheet("font-weight: bold; margin-top: 10px;")
-        date_section_layout.addWidget(date_label)
-
         date_group_layout = QHBoxLayout()
         self.year_input = QLineEdit()
         self.year_input.setPlaceholderText("YYYY")
-        self.year_input.setFixedWidth(100)
-        
         self.month_input = QLineEdit()
         self.month_input.setPlaceholderText("MM")
-        self.month_input.setFixedWidth(100)
-        
         self.day_input = QLineEdit()
         self.day_input.setPlaceholderText("DD")
-        self.day_input.setFixedWidth(100)
 
-        date_group_layout.addWidget(self.year_input)
-        date_group_layout.addWidget(self.month_input)
-        date_group_layout.addWidget(self.day_input)
+        for inp in [self.year_input, self.month_input, self.day_input]:
+            inp.setFixedWidth(80)
+            date_group_layout.addWidget(inp)
+            
         date_group_layout.addStretch()
-        
         date_section_layout.addLayout(date_group_layout)
         self.main_layout.addLayout(date_section_layout)
 
-        # Description Input
         self.desc_input = QLineEdit()
-        self.desc_input.setPlaceholderText("Type description (Title) here...")
+        self.desc_input.setPlaceholderText("Type description here...")
         self.desc_input.setFixedHeight(40)
         self.desc_input.returnPressed.connect(self.process_and_next)
         self.main_layout.addWidget(self.desc_input)
 
-        # --- Navigation Buttons ---
+        # Navigation
         self.nav_layout = QHBoxLayout()
-        
         self.back_btn = QPushButton("← Back")
-        self.back_btn.setFixedWidth(100)
-        self.back_btn.setFixedHeight(50)
-        self.back_btn.clicked.connect(self.prev_image)
-        
         self.forward_btn = QPushButton("Forward →")
-        self.forward_btn.setFixedWidth(100)
-        self.forward_btn.setFixedHeight(50)
-        self.forward_btn.clicked.connect(self.forward_image)
-
-        self.next_btn = QPushButton("Process & Next →")
-        self.next_btn.setFixedHeight(50)
-        self.next_btn.setStyleSheet("background-color: #2196F3; color: white; font-size: 16px; font-weight: bold;")
-        self.next_btn.clicked.connect(self.process_and_next)
+        self.ff_btn = QPushButton("Fast Forward ⏩")
+        self.next_btn = QPushButton("Process & Convert →")
         
-        self.nav_layout.addWidget(self.back_btn)
-        self.nav_layout.addWidget(self.forward_btn)
-        self.nav_layout.addWidget(self.next_btn)
-        self.main_layout.addLayout(self.nav_layout)
+        self.back_btn.clicked.connect(self.prev_image)
+        self.forward_btn.clicked.connect(self.forward_image)
+        self.ff_btn.clicked.connect(self.fast_forward)
+        self.next_btn.clicked.connect(self.process_and_next)
 
+        self.ff_btn.setStyleSheet("background-color: #FF9800; color: white; font-weight: bold;")
+        self.next_btn.setStyleSheet("background-color: #2196F3; color: white; font-size: 16px; font-weight: bold;")
+        
+        for btn in [self.back_btn, self.forward_btn, self.ff_btn, self.next_btn]:
+            btn.setFixedHeight(50)
+            self.nav_layout.addWidget(btn)
+
+        self.main_layout.addLayout(self.nav_layout)
         self.setLayout(self.main_layout)
 
     def load_last_path(self):
@@ -128,8 +169,7 @@ class ImageDescriber(QWidget):
                 with open(self.config_file, 'r') as f:
                     data = yaml.safe_load(f)
                     return data.get("last_path", "")
-        except Exception as e:
-            print(f"Error loading config: {e}")
+        except: pass
         return ""
 
     def save_last_path(self):
@@ -137,8 +177,7 @@ class ImageDescriber(QWidget):
             self.config_dir.mkdir(parents=True, exist_ok=True)
             with open(self.config_file, 'w') as f:
                 yaml.dump({"last_path": self.folder_path}, f)
-        except Exception as e:
-            print(f"Error saving config: {e}")
+        except: pass
 
     def select_folder(self):
         dir_path = QFileDialog.getExistingDirectory(self, "Select Directory", self.folder_path)
@@ -149,101 +188,101 @@ class ImageDescriber(QWidget):
         self.folder_path = folder_path
         self.path_label.setText(folder_path)
         self.save_last_path()
-        
         self.output_folder = os.path.join(folder_path, "processed")
         if not os.path.exists(self.output_folder):
             os.makedirs(self.output_folder)
 
-        valid_extensions = ('.jpg', '.jpeg', '.tiff', '.bmp', '.png')
+        valid_extensions = ('.jpg', '.jpeg', '.tiff', '.bmp', '.png', '.webp')
         self.files = sorted([f for f in os.listdir(folder_path) if f.lower().endswith(valid_extensions)])
         self.current_index = 0
         self.load_image()
 
+    def find_best_meta_source(self, base_name, original_ext):
+        processed_path = os.path.join(self.output_folder, base_name + ".jpg")
+        if os.path.exists(processed_path): return processed_path
+        local_webp = os.path.join(self.folder_path, base_name + ".webp")
+        if os.path.exists(local_webp): return local_webp
+        return os.path.join(self.folder_path, base_name + original_ext)
+
     def load_image(self):
-        if 0 <= self.current_index < len(self.files):
-            self.desc_input.setEnabled(True)
-            self.next_btn.setEnabled(True)
-            self.forward_btn.setEnabled(True)
-            self.back_btn.setEnabled(self.current_index > 0)
-            self.next_btn.setText("Process & Next →")
-            self.next_btn.setStyleSheet("background-color: #2196F3; color: white; font-size: 16px; font-weight: bold;")
+        self.next_btn.setText("Process & Convert →")
+        
+        if not self.files or self.current_index >= len(self.files):
+            self.viewer.setPhoto(None)
+            self.progress_label.setText("Finished")
+            return
 
-            filename = self.files[self.current_index]
-            original_file_path = os.path.join(self.folder_path, filename)
-            processed_file_path = os.path.join(self.output_folder, f"{os.path.splitext(filename)[0]}.jpg")
-            is_processed = os.path.exists(processed_file_path)
-            read_path = processed_file_path if is_processed else original_file_path
+        filename = self.files[self.current_index]
+        file_path = os.path.join(self.folder_path, filename)
+        base_name, ext = os.path.splitext(filename)
+        meta_read_path = self.find_best_meta_source(base_name, ext)
+        
+        self.progress_label.setText(f"Image {self.current_index + 1} of {len(self.files)}")
+        self.file_info_label.setText(f"File: {filename}")
+        self.desc_input.clear()
+
+        # Handle Exif Data
+        try:
+            img = Image.open(meta_read_path)
+            if "exif" in img.info:
+                exif_dict = piexif.load(img.info["exif"])
+                dt_str = exif_dict.get("Exif", {}).get(piexif.ExifIFD.DateTimeOriginal)
+                if dt_str:
+                    date_part = dt_str.decode('utf-8').split(' ')[0]
+                    y, m, d = date_part.split(':')
+                    self.year_input.setText(y)
+                    self.month_input.setText(m)
+                    self.day_input.setText(d)
+                
+                desc = exif_dict.get("0th", {}).get(piexif.ImageIFD.ImageDescription)
+                if desc: self.desc_input.setText(desc.decode('utf-8'))
+            img.close()
+
+            pixmap = QPixmap(file_path)
+            self.viewer.setPhoto(pixmap)
+        except Exception as e:
+            print(f"Error loading: {e}")
+
+        self.desc_input.setFocus()
+
+    def process_and_next(self):
+        if self.current_index >= len(self.files): return
+        
+        self.next_btn.setEnabled(False)
+        filename = self.files[self.current_index]
+        file_path = os.path.join(self.folder_path, filename)
+        base_name, ext = os.path.splitext(filename)
+        
+        y, m, d = self.year_input.text(), self.month_input.text(), self.day_input.text()
+        description = self.desc_input.text().strip()
+
+        try:
+            img = Image.open(file_path)
+            img = ImageOps.exif_transpose(img)
+            exif_dict = {"0th": {}, "Exif": {}, "1st": {}, "thumbnail": None, "GPS": {}}
             
-            self.progress_label.setText(f"Image {self.current_index + 1} of {len(self.files)}")
-            self.file_info_label.setText(f"File: {filename} {'(Edited)' if is_processed else ''}")
+            exif_date = f"{y if y else '1900'}:{m.zfill(2) if m else '01'}:{d.zfill(2) if d else '01'} 12:00:00"
+            exif_dict['0th'][piexif.ImageIFD.DateTime] = exif_date
+            exif_dict['Exif'][piexif.ExifIFD.DateTimeOriginal] = exif_date
             
-            self.desc_input.clear()
-            self.year_input.clear()
-            self.month_input.clear()
-            self.day_input.clear()
+            if description:
+                exif_dict['0th'][piexif.ImageIFD.ImageDescription] = description.encode('utf-8')
 
-            found_exif_date = False
-            try:
-                img = Image.open(read_path)
-                if "exif" in img.info:
-                    exif_dict = piexif.load(img.info["exif"])
-                    
-                    # Load Date
-                    dt_str = None
-                    if piexif.ExifIFD.DateTimeOriginal in exif_dict.get("Exif", {}):
-                        dt_str = exif_dict["Exif"][piexif.ExifIFD.DateTimeOriginal].decode('utf-8')
-                    elif piexif.ImageIFD.DateTime in exif_dict.get("0th", {}):
-                        dt_str = exif_dict["0th"][piexif.ImageIFD.DateTime].decode('utf-8')
-                    
-                    if dt_str:
-                        try:
-                            date_part = dt_str.split(' ')[0]
-                            y, m, d = date_part.split(':')
-                            self.year_input.setText(y)
-                            self.month_input.setText(m)
-                            self.day_input.setText(d)
-                            self.last_date = {"y": y, "m": m, "d": d}
-                            found_exif_date = True
-                        except: pass
+            exif_bytes = piexif.dump(exif_dict)
+            
+            # Save Lossless WebP
+            img.save(os.path.join(self.folder_path, base_name + ".webp"), "WEBP", lossless=True, exif=exif_bytes)
+            # Save Processed JPG
+            img.convert("RGB").save(os.path.join(self.output_folder, base_name + ".jpg"), "JPEG", quality=90, exif=exif_bytes)
+            
+            img.close()
+            self.current_index += 1
+        except Exception as e:
+            print(f"Error: {e}")
+            self.current_index += 1
 
-                    # LOAD TITLE (Description)
-                    if piexif.ImageIFD.ImageDescription in exif_dict.get("0th", {}):
-                        try:
-                            desc = exif_dict["0th"][piexif.ImageIFD.ImageDescription].decode('utf-8')
-                            self.desc_input.setText(desc)
-                        except: pass
-                    elif piexif.ImageIFD.XPTitle in exif_dict.get("0th", {}):
-                        try:
-                            desc = exif_dict["0th"][piexif.ImageIFD.XPTitle].decode('utf-16le').strip('\x00')
-                            self.desc_input.setText(desc)
-                        except: pass
-
-                if not found_exif_date:
-                    self.year_input.setText(self.last_date["y"])
-                    self.month_input.setText(self.last_date["m"])
-                    self.day_input.setText(self.last_date["d"])
-
-                pixmap = QPixmap(original_file_path)
-                if not pixmap.isNull():
-                    scaled_pixmap = pixmap.scaled(self.image_label.width(), self.image_label.height(), 
-                                                Qt.KeepAspectRatio, Qt.SmoothTransformation)
-                    self.image_label.setPixmap(scaled_pixmap)
-                else:
-                    self.image_label.setText("Error loading preview.")
-            except Exception as e:
-                print(f"Error loading: {e}")
-                self.image_label.setText("Error opening file.")
-
-            self.desc_input.setFocus()
-
-        elif len(self.files) > 0 and self.current_index >= len(self.files):
-            self.image_label.clear()
-            self.image_label.setText("Processing Complete!")
-            self.file_info_label.setText("All files in folder have been handled.")
-            self.desc_input.setEnabled(False)
-            self.next_btn.setEnabled(False)
-            self.forward_btn.setEnabled(False)
-            self.back_btn.setEnabled(True)
+        self.next_btn.setEnabled(True)
+        self.load_image()
 
     def prev_image(self):
         if self.current_index > 0:
@@ -251,68 +290,21 @@ class ImageDescriber(QWidget):
             self.load_image()
 
     def forward_image(self):
-        if self.current_index < len(self.files):
+        if self.current_index < len(self.files) - 1:
             self.current_index += 1
             self.load_image()
 
-    def process_and_next(self):
-        if self.current_index >= len(self.files):
-            return
-
-        self.next_btn.setEnabled(False)
-        self.next_btn.setText("Processing...")
-        QApplication.processEvents()
-
-        filename = self.files[self.current_index]
-        file_path = os.path.join(self.folder_path, filename)
-        description = self.desc_input.text().strip()
-        
-        y, m, d = self.year_input.text().strip(), self.month_input.text().strip(), self.day_input.text().strip()
-        if y or m or d:
-            self.last_date = {"y": y, "m": m, "d": d}
-
-        try:
-            img = Image.open(file_path)
-            if hasattr(img, '_getexif') and img._getexif():
-                from PIL import ImageOps
-                img = ImageOps.exif_transpose(img)
-            if img.mode != "RGB":
-                img = img.convert("RGB")
-
-            exif_dict = {"0th": {}, "Exif": {}, "1st": {}, "thumbnail": None, "GPS": {}}
-            
-            # Save Date
-            if y or m or d:
-                exif_date = f"{y if y else '1900'}:{m.zfill(2) if m else '01'}:{d.zfill(2) if d else '01'} 12:00:00"
-                exif_dict['0th'][piexif.ImageIFD.DateTime] = exif_date
-                exif_dict['Exif'][piexif.ExifIFD.DateTimeOriginal] = exif_date
-                exif_dict['Exif'][piexif.ExifIFD.DateTimeDigitized] = exif_date
-            
-            # SAVE TITLE
-            if description:
-                # Standard Exif Title/Description
-                exif_dict['0th'][piexif.ImageIFD.ImageDescription] = description.encode('utf-8')
-                # Windows Specific Title
-                exif_dict['0th'][piexif.ImageIFD.XPTitle] = description.encode('utf-16le')
-
-            exif_bytes = piexif.dump(exif_dict)
-            save_path = os.path.join(self.output_folder, f"{os.path.splitext(filename)[0]}.jpg")
-            img.save(save_path, "JPEG", optimize=True, exif=exif_bytes, quality=90)
-
-        except Exception as e:
-            print(f"Error processing {filename}: {e}")
-
-        self.current_index += 1
+    def fast_forward(self):
+        for i in range(self.current_index, len(self.files)):
+            base_name, _ = os.path.splitext(self.files[i])
+            if not os.path.exists(os.path.join(self.output_folder, base_name + ".jpg")):
+                self.current_index = i
+                break
         self.load_image()
 
     def resizeEvent(self, event):
-        if self.files and self.current_index < len(self.files):
-            self.load_image()
+        self.viewer.fitInView()
         super().resizeEvent(event)
-
-    def closeEvent(self, event):
-        self.save_last_path()
-        event.accept()
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
