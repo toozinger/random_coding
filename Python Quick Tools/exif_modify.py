@@ -12,6 +12,53 @@ from PIL import Image, ImageOps
 import piexif
 import queue
 
+# --- NEW UTILITY FUNCTION FOR HEADLESS & GUI ---
+def get_existing_metadata(file_path, output_folder):
+    """
+    Looks for EXIF data in the source file or a previously processed version.
+    Returns (y, m, d, description)
+    """
+    y, m, d, desc_str = "", "", "", ""
+    exif_data = None
+    filename = os.path.basename(file_path)
+    
+    # Try source file
+    try:
+        with Image.open(file_path) as img:
+            exif_data = img.info.get("exif")
+    except: pass
+
+    # Try processed folder if source has none
+    if not exif_data:
+        base_name, _ = os.path.splitext(filename)
+        for ext in ['.webp', '.jpg', '.jpeg']:
+            p_path = os.path.join(output_folder, base_name + ext)
+            if os.path.exists(p_path):
+                try:
+                    with Image.open(p_path) as p_img:
+                        exif_data = p_img.info.get("exif")
+                        if exif_data: break
+                except: pass
+
+    if exif_data:
+        exif = piexif.load(exif_data)
+        # Extract Date
+        dt = exif.get("Exif", {}).get(piexif.ExifIFD.DateTimeOriginal)
+        if dt:
+            try:
+                date_part = dt.decode().split(' ')[0]
+                y, m, d = date_part.split(':')
+            except: pass
+        
+        # Extract Description
+        raw_desc = exif.get("0th", {}).get(piexif.ImageIFD.ImageDescription)
+        if raw_desc:
+            try:
+                desc_str = raw_desc.decode('utf-8')
+            except: pass
+            
+    return y, m, d, desc_str
+
 class ImageTask:
     def __init__(self, file_path, output_folder, folder_path, y, m, d, description, rotation):
         self.file_path = file_path
@@ -20,7 +67,7 @@ class ImageTask:
         self.base_name, self.ext = os.path.splitext(os.path.basename(file_path))
         self.y, self.m, self.d = y, m, d
         self.description = description
-        self.rotation = rotation  # The rotation angle to apply permanently
+        self.rotation = rotation
         self.new_webp_name = self.base_name + ".webp"
 
 class ProcessorThread(QThread):
@@ -43,42 +90,43 @@ class ProcessorThread(QThread):
                 continue
 
     def process_image(self, task):
-        try:
-            img = Image.open(task.file_path)
-            # Normalize orientation based on existing EXIF first
-            img = ImageOps.exif_transpose(img)
-            
-            # Apply requested manual rotation (PIL uses counter-clockwise)
-            if task.rotation != 0:
-                img = img.rotate(task.rotation, expand=True)
-            
-            exif_dict = {"0th": {}, "Exif": {}, "1st": {}, "thumbnail": None, "GPS": {}}
-            exif_date = f"{task.y if task.y else '1900'}:{task.m.zfill(2) if task.m else '01'}:{task.d.zfill(2) if task.d else '01'} 12:00:00"
-            exif_dict['0th'][piexif.ImageIFD.DateTime] = exif_date
-            exif_dict['Exif'][piexif.ExifIFD.DateTimeOriginal] = exif_date
-            
-            if task.description:
-                exif_dict['0th'][piexif.ImageIFD.ImageDescription] = task.description.encode('utf-8')
+        img = Image.open(task.file_path)
+        img = ImageOps.exif_transpose(img)
+        
+        if task.rotation != 0:
+            img = img.rotate(task.rotation, expand=True)
+        
+        exif_dict = {"0th": {}, "Exif": {}, "1st": {}, "thumbnail": None, "GPS": {}}
+        exif_date = f"{task.y if task.y else '1900'}:{task.m.zfill(2) if task.m else '01'}:{task.d.zfill(2) if task.d else '01'} 12:00:00"
+        exif_dict['0th'][piexif.ImageIFD.DateTime] = exif_date
+        exif_dict['Exif'][piexif.ExifIFD.DateTimeOriginal] = exif_date
+        
+        if task.description:
+            exif_dict['0th'][piexif.ImageIFD.ImageDescription] = task.description.encode('utf-8')
 
-            exif_bytes = piexif.dump(exif_dict)
-            
-            # Save Lossless
-            new_webp_path = os.path.join(task.folder_path, task.new_webp_name)
-            img.save(new_webp_path, "WEBP", lossless=True, method=6, exif=exif_bytes)
-            self.log_signal.emit(f"SAVED (Lossless): {task.new_webp_name}")
+        exif_bytes = piexif.dump(exif_dict)
+        
+        if os.path.exists(task.output_folder):
+            for existing_file in os.listdir(task.output_folder):
+                name_part, _ = os.path.splitext(existing_file)
+                if name_part == task.base_name:
+                    try:
+                        os.remove(os.path.join(task.output_folder, existing_file))
+                        self.log_signal.emit(f"DELETED existing: {existing_file}")
+                    except: pass
+                    
+        new_webp_path = os.path.join(task.folder_path, task.new_webp_name)
+        img.save(new_webp_path, "WEBP", lossless=True, method=6, exif=exif_bytes)
+        self.log_signal.emit(f"SAVED (Lossless): {task.new_webp_name}")
 
-            # Save Lossy
-            lossy_path = os.path.join(task.output_folder, task.new_webp_name)
-            img.convert("RGB").save(lossy_path, "WEBP", quality=90, method=6, exif=exif_bytes)
-            self.log_signal.emit(f"SAVED (Lossy): {task.new_webp_name} to processed/")
+        lossy_path = os.path.join(task.output_folder, task.new_webp_name)
+        img.convert("RGB").save(lossy_path, "WEBP", quality=90, method=6, exif=exif_bytes)
+        self.log_signal.emit(f"SAVED (Lossy): {task.new_webp_name} to processed/")
 
-            img.close()
+        img.close()
+        if os.path.abspath(task.file_path) != os.path.abspath(new_webp_path):
+            os.remove(task.file_path)
 
-            if task.file_path != new_webp_path:
-                try: os.remove(task.file_path)
-                except: pass
-        except Exception as e:
-            self.log_signal.emit(f"ERROR processing {task.base_name}: {e}")
 
 class PhotoViewer(QGraphicsView):
     def __init__(self, parent=None):
@@ -291,50 +339,19 @@ class ImageDescriber(QWidget):
         filename = self.files[self.current_index]
         self.progress_label.setText(f"Image {self.current_index + 1} of {len(self.files)}")
         self.file_info_label.setText(f"File: {filename}")
-        
-        # Always clear description for a new image
         self.desc_input.clear()
     
         img_path = os.path.join(self.folder_path, filename)
-        img = Image.open(img_path)
-        exif_data = img.info.get("exif")
         
-        # Check processed folder if root file has no exif
-        if not exif_data:
-            base_name, _ = os.path.splitext(filename)
-            for ext in ['.webp', '.jpg', '.jpeg']:
-                processed_path = os.path.join(self.output_folder, base_name + ext)
-                if os.path.exists(processed_path):
-                    with Image.open(processed_path) as p_img:
-                        exif_data = p_img.info.get("exif")
-                        if exif_data: break
-
-        if exif_data:
-            # Metadata found: Overwrite inputs with file data
-            exif = piexif.load(exif_data)
-            dt = exif.get("Exif", {}).get(piexif.ExifIFD.DateTimeOriginal)
-            if dt:
-                try:
-                    y, m, d = dt.decode().split(' ')[0].split(':')
-                    self.year_input.setText(y)
-                    self.month_input.setText(m)
-                    self.day_input.setText(d)
-                except: pass
-            else:
-                # If file has exif but no date, keep the previous date
-                pass
-
-            desc = exif.get("0th", {}).get(piexif.ImageIFD.ImageDescription)
-            if desc:
-                self.desc_input.setText(desc.decode('utf-8'))
-        else:
-            # No metadata found at all: keep prev_y, prev_m, prev_d in the inputs
-            # (Logic: We don't call .clear() on date inputs here)
-            pass
+        # USE THE NEW UTILITY FUNCTION
+        y, m, d, desc = get_existing_metadata(img_path, self.output_folder)
         
-        img.close()
+        if y: self.year_input.setText(y)
+        if m: self.month_input.setText(m)
+        if d: self.day_input.setText(d)
+        if desc: self.desc_input.setText(desc)
+        
         self.viewer.setPhoto(QPixmap(img_path))
-
         self.desc_input.setFocus()
 
     def process_and_next(self):
