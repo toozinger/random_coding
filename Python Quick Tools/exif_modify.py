@@ -72,13 +72,17 @@ class ImageTask:
 
 class ProcessorThread(QThread):
     log_signal = pyqtSignal(str)
+    # Signal to tell UI a specific file is finished
+    finished_file_signal = pyqtSignal(str) 
 
     def __init__(self):
         super().__init__()
         self.task_queue = queue.Queue()
         self.running = True
+        self.in_progress = set() # Track active paths
 
     def add_task(self, task):
+        self.in_progress.add(os.path.abspath(task.file_path))
         self.task_queue.put(task)
 
     def run(self):
@@ -86,6 +90,11 @@ class ProcessorThread(QThread):
             try:
                 task = self.task_queue.get(timeout=1)
                 self.process_image(task)
+                # Remove from set and notify UI
+                path = os.path.abspath(task.file_path)
+                if path in self.in_progress:
+                    self.in_progress.remove(path)
+                self.finished_file_signal.emit(path)
             except queue.Empty:
                 continue
 
@@ -200,6 +209,12 @@ class ImageDescriber(QWidget):
         self.initUI()
         if self.folder_path and os.path.exists(self.folder_path):
             self.scan_folder(self.folder_path)
+            
+    def on_file_finished(self, path):
+        # If the user is currently looking at the file that just finished
+        current_file = os.path.abspath(os.path.join(self.folder_path, self.files[self.current_index]))
+        if path == current_file:
+            self.load_image()
 
     def initUI(self):
         self.setWindowTitle('Photo Metadata Tagger')
@@ -333,25 +348,39 @@ class ImageDescriber(QWidget):
         if not self.files or self.current_index >= len(self.files):
             self.viewer.setPhoto(None)
             self.progress_label.setText("Done!")
-            self.file_info_label.setText("")
             return
         
         filename = self.files[self.current_index]
+        img_path = os.path.abspath(os.path.join(self.folder_path, filename))
+
+        # 1. Check if background thread is busy with this specific file
+        if img_path in self.processor.in_progress:
+            self.progress_label.setText(f"PROCESSING... {filename}")
+            self.viewer.setPhoto(None) # Or a "Loading" pixmap
+            self.file_info_label.setText("File is being written, please wait...")
+            return
+
         self.progress_label.setText(f"Image {self.current_index + 1} of {len(self.files)}")
         self.file_info_label.setText(f"File: {filename}")
         self.desc_input.clear()
     
-        img_path = os.path.join(self.folder_path, filename)
-        
-        # USE THE NEW UTILITY FUNCTION
+        # 2. LOAD WITHOUT LOCKING
+        try:
+            with open(img_path, 'rb') as f:
+                data = f.read()
+                pixmap = QPixmap()
+                pixmap.loadFromData(data)
+                self.viewer.setPhoto(pixmap)
+        except Exception as e:
+            self.update_console(f"Error loading {filename}: {e}")
+
+        # 3. Get Metadata
         y, m, d, desc = get_existing_metadata(img_path, self.output_folder)
-        
         if y: self.year_input.setText(y)
         if m: self.month_input.setText(m)
         if d: self.day_input.setText(d)
         if desc: self.desc_input.setText(desc)
         
-        self.viewer.setPhoto(QPixmap(img_path))
         self.desc_input.setFocus()
 
     def process_and_next(self):
