@@ -225,9 +225,16 @@ class ImageDescriber(QWidget):
         self.top_layout = QHBoxLayout()
         self.path_label = QLabel(self.folder_path if self.folder_path else "No folder selected")
         self.path_label.setStyleSheet("color: #666; font-style: italic;")
+        
+        # New Reload & FF Button
+        self.reload_and_ff_btn = QPushButton("↻ Reload && FF")
+        self.reload_and_ff_btn.clicked.connect(self.reload_and_ff)
+        
         self.browse_btn = QPushButton("Browse Folder")
         self.browse_btn.clicked.connect(self.select_folder)
+        
         self.top_layout.addWidget(self.path_label, 1)
+        self.top_layout.addWidget(self.reload_and_ff_btn) # Added to the left of browse
         self.top_layout.addWidget(self.browse_btn)
         self.main_layout.addLayout(self.top_layout)
 
@@ -275,7 +282,7 @@ class ImageDescriber(QWidget):
         self.back_btn = QPushButton("← Back")
         self.forward_btn = QPushButton("Forward →")
         self.ff_btn = QPushButton("Fast Forward ⏩")
-        self.next_btn = QPushButton("Process & Next →")
+        self.next_btn = QPushButton("Process && Next →")
         
         self.ff_btn.setStyleSheet("background-color: #FF9800; color: white; font-weight: bold;")
         self.next_btn.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold;")
@@ -301,10 +308,15 @@ class ImageDescriber(QWidget):
         self.setLayout(self.main_layout)
         self.desc_input.returnPressed.connect(self.process_and_next)
 
+    def reload_and_ff(self):
+        """Rescans the current folder and fast forwards to the first unprocessed image."""
+        if self.folder_path and os.path.exists(self.folder_path):
+            self.update_console("Reloading folder...")
+            self.scan_folder(self.folder_path)
+            self.fast_forward()
+
     def rotate_image(self, angle):
         """Rotate visually in the viewer and track the total angle for PIL."""
-        # angle is positive for CCW (Left) and negative for CW (Right)
-        # PIL also uses positive CCW, so this maps perfectly.
         self.current_rotation = (self.current_rotation + angle) % 360
         self.viewer.rotate(-angle) # QGraphicsView.rotate uses Clockwise as positive
 
@@ -327,19 +339,34 @@ class ImageDescriber(QWidget):
         except: pass
 
     def select_folder(self):
+        # Pass the current folder_path as the starting directory
         p = QFileDialog.getExistingDirectory(self, "Select Folder", self.folder_path)
-        if p: self.scan_folder(p)
+        if p: 
+            # Reset index before scanning to ensure we start at the first image
+            self.current_index = 0
+            self.scan_folder(p)
 
     def scan_folder(self, p):
         self.folder_path = p
         self.path_label.setText(p)
         self.save_last_path()
+        
         self.output_folder = os.path.join(p, "processed")
-        if not os.path.exists(self.output_folder): os.makedirs(self.output_folder)
+        if not os.path.exists(self.output_folder): 
+            os.makedirs(self.output_folder)
+        
+        # Ensure we only grab actual image files
         valid = ('.jpg', '.jpeg', '.tiff', '.bmp', '.png', '.webp')
         self.files = sorted([f for f in os.listdir(p) if f.lower().endswith(valid)])
-        self.current_index = 0
-        self.load_image()
+        
+        if self.files:
+            self.update_console(f"Found {len(self.files)} images.")
+            self.load_image()
+        else:
+            self.update_console("No valid images found in selected folder.")
+            self.viewer.setPhoto(None)
+            self.progress_label.setText("No images found.")
+            self.file_info_label.setText("")
 
     def load_image(self):
         self.current_rotation = 0 
@@ -353,10 +380,9 @@ class ImageDescriber(QWidget):
         filename = self.files[self.current_index]
         img_path = os.path.abspath(os.path.join(self.folder_path, filename))
 
-        # 1. Check if background thread is busy with this specific file
         if img_path in self.processor.in_progress:
             self.progress_label.setText(f"PROCESSING... {filename}")
-            self.viewer.setPhoto(None) # Or a "Loading" pixmap
+            self.viewer.setPhoto(None)
             self.file_info_label.setText("File is being written, please wait...")
             return
 
@@ -364,7 +390,6 @@ class ImageDescriber(QWidget):
         self.file_info_label.setText(f"File: {filename}")
         self.desc_input.clear()
     
-        # 2. LOAD WITHOUT LOCKING
         try:
             with open(img_path, 'rb') as f:
                 data = f.read()
@@ -374,7 +399,6 @@ class ImageDescriber(QWidget):
         except Exception as e:
             self.update_console(f"Error loading {filename}: {e}")
 
-        # 3. Get Metadata
         y, m, d, desc = get_existing_metadata(img_path, self.output_folder)
         if y: self.year_input.setText(y)
         if m: self.month_input.setText(m)
@@ -395,7 +419,7 @@ class ImageDescriber(QWidget):
             m=self.month_input.text(),
             d=self.day_input.text(),
             description=self.desc_input.text().strip(),
-            rotation=self.current_rotation # Pass the rotation to the worker
+            rotation=self.current_rotation
         )
 
         self.files[self.current_index] = task.new_webp_name
@@ -414,31 +438,27 @@ class ImageDescriber(QWidget):
             self.load_image()
 
     def fast_forward(self):
-            # Define extensions to check for in the output folder
-            valid_exts = ('.jpg', '.jpeg', '.tiff', '.bmp', '.png', '.webp')
+        valid_exts = ('.jpg', '.jpeg', '.tiff', '.bmp', '.png', '.webp')
+        
+        for i in range(0, len(self.files)): # Check from start after a reload
+            filename = self.files[i]
+            base_name, _ = os.path.splitext(filename)
             
-            for i in range(self.current_index, len(self.files)):
-                filename = self.files[i]
-                base_name, _ = os.path.splitext(filename)
+            already_processed = False
+            for ext in valid_exts:
+                if os.path.exists(os.path.join(self.output_folder, base_name + ext)):
+                    already_processed = True
+                    break
+            
+            if already_processed:
+                continue
                 
-                # Check if any version of this file exists in the processed folder
-                already_processed = False
-                for ext in valid_exts:
-                    if os.path.exists(os.path.join(self.output_folder, base_name + ext)):
-                        already_processed = True
-                        break
-                
-                if already_processed:
-                    continue
-                    
-                # If we find a file that hasn't been processed yet, stop here
-                self.current_index = i
-                break
-            else:
-                # If all remaining files were processed, go to the end
-                self.current_index = len(self.files)
-                
-            self.load_image()
+            self.current_index = i
+            break
+        else:
+            self.current_index = len(self.files)
+            
+        self.load_image()
 
     def resizeEvent(self, event):
         self.viewer.fitInView()
