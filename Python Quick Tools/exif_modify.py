@@ -1,5 +1,7 @@
+import io
 import os
 import sys
+import time
 import yaml
 from pathlib import Path
 from platformdirs import user_config_dir
@@ -73,7 +75,9 @@ class ImageTask:
 class ProcessorThread(QThread):
     log_signal = pyqtSignal(str)
     # Signal to tell UI a specific file is finished
-    finished_file_signal = pyqtSignal(str) 
+    finished_file_signal = pyqtSignal(str)
+    # Preview: (webp_path, image_bytes, y, m, d, description) so UI can show from memory
+    preview_ready_signal = pyqtSignal(str, bytes, str, str, str, str) 
 
     def __init__(self):
         super().__init__()
@@ -99,22 +103,39 @@ class ProcessorThread(QThread):
                 continue
 
     def process_image(self, task):
-        img = Image.open(task.file_path)
+        # Load into an in-memory copy so the original file handle is released immediately.
+        # This avoids PermissionError when deleting the source (e.g. if user clicks Back
+        # or another process has the file open).
+        with Image.open(task.file_path) as opened:
+            img = opened.copy()
         img = ImageOps.exif_transpose(img)
-        
+
         if task.rotation != 0:
             img = img.rotate(task.rotation, expand=True)
-        
+
         exif_dict = {"0th": {}, "Exif": {}, "1st": {}, "thumbnail": None, "GPS": {}}
         exif_date = f"{task.y if task.y else '1900'}:{task.m.zfill(2) if task.m else '01'}:{task.d.zfill(2) if task.d else '01'} 12:00:00"
         exif_dict['0th'][piexif.ImageIFD.DateTime] = exif_date
         exif_dict['Exif'][piexif.ExifIFD.DateTimeOriginal] = exif_date
-        
+
         if task.description:
             exif_dict['0th'][piexif.ImageIFD.ImageDescription] = task.description.encode('utf-8')
 
         exif_bytes = piexif.dump(exif_dict)
-        
+
+        # Send preview to UI so it can show this image from memory (no disk read while saving)
+        new_webp_path = os.path.join(task.folder_path, task.new_webp_name)
+        buf = io.BytesIO()
+        img.save(buf, "PNG")
+        self.preview_ready_signal.emit(
+            os.path.abspath(new_webp_path),
+            buf.getvalue(),
+            task.y or "",
+            task.m or "",
+            task.d or "",
+            task.description or "",
+        )
+
         if os.path.exists(task.output_folder):
             for existing_file in os.listdir(task.output_folder):
                 name_part, _ = os.path.splitext(existing_file)
@@ -123,8 +144,7 @@ class ProcessorThread(QThread):
                         os.remove(os.path.join(task.output_folder, existing_file))
                         self.log_signal.emit(f"DELETED existing: {existing_file}")
                     except: pass
-                    
-        new_webp_path = os.path.join(task.folder_path, task.new_webp_name)
+
         img.save(new_webp_path, "WEBP", lossless=True, method=6, exif=exif_bytes)
         self.log_signal.emit(f"SAVED (Lossless): {task.new_webp_name}")
 
@@ -133,8 +153,19 @@ class ProcessorThread(QThread):
         self.log_signal.emit(f"SAVED (Lossy): {task.new_webp_name} to processed/")
 
         img.close()
+
+        # Delete source only if it's a different path. Retry a few times on Windows
+        # in case another process (e.g. UI, antivirus) still has the file open.
         if os.path.abspath(task.file_path) != os.path.abspath(new_webp_path):
-            os.remove(task.file_path)
+            for attempt in range(3):
+                try:
+                    os.remove(task.file_path)
+                    break
+                except PermissionError:
+                    if attempt < 2:
+                        time.sleep(0.25)
+                    else:
+                        self.log_signal.emit(f"Could not delete original (in use): {os.path.basename(task.file_path)}")
 
 
 class PhotoViewer(QGraphicsView):
@@ -204,12 +235,18 @@ class ImageDescriber(QWidget):
 
         self.processor = ProcessorThread()
         self.processor.log_signal.connect(self.update_console)
+        self.processor.preview_ready_signal.connect(self.on_preview_ready)
         self.processor.start()
+        # In-memory preview: path -> (image_bytes, y, m, d, description)
+        self.preview_cache = {}
 
         self.initUI()
         if self.folder_path and os.path.exists(self.folder_path):
             self.scan_folder(self.folder_path)
             
+    def on_preview_ready(self, webp_path, image_bytes, y, m, d, desc):
+        self.preview_cache[os.path.abspath(webp_path)] = (image_bytes, y, m, d, desc or "")
+
     def on_file_finished(self, path):
         # If the user is currently looking at the file that just finished
         current_file = os.path.abspath(os.path.join(self.folder_path, self.files[self.current_index]))
@@ -348,6 +385,7 @@ class ImageDescriber(QWidget):
 
     def scan_folder(self, p):
         self.folder_path = p
+        self.preview_cache.clear()
         self.path_label.setText(p)
         self.save_last_path()
         
@@ -380,16 +418,27 @@ class ImageDescriber(QWidget):
         filename = self.files[self.current_index]
         img_path = os.path.abspath(os.path.join(self.folder_path, filename))
 
-        if img_path in self.processor.in_progress:
-            self.progress_label.setText(f"PROCESSING... {filename}")
-            self.viewer.setPhoto(None)
-            self.file_info_label.setText("File is being written, please wait...")
-            return
-
         self.progress_label.setText(f"Image {self.current_index + 1} of {len(self.files)}")
         self.file_info_label.setText(f"File: {filename}")
         self.desc_input.clear()
-    
+
+        # Use in-memory preview if we have it (same image/metadata as sent to save)
+        if img_path in self.preview_cache:
+            image_bytes, y, m, d, desc = self.preview_cache[img_path]
+            pixmap = QPixmap()
+            pixmap.loadFromData(image_bytes)
+            self.viewer.setPhoto(pixmap)
+            if y:
+                self.year_input.setText(y)
+            if m:
+                self.month_input.setText(m)
+            if d:
+                self.day_input.setText(d)
+            if desc:
+                self.desc_input.setText(desc)
+            self.desc_input.setFocus()
+            return
+
         try:
             with open(img_path, 'rb') as f:
                 data = f.read()
@@ -397,14 +446,19 @@ class ImageDescriber(QWidget):
                 pixmap.loadFromData(data)
                 self.viewer.setPhoto(pixmap)
         except Exception as e:
+            self.viewer.setPhoto(None)
             self.update_console(f"Error loading {filename}: {e}")
 
         y, m, d, desc = get_existing_metadata(img_path, self.output_folder)
-        if y: self.year_input.setText(y)
-        if m: self.month_input.setText(m)
-        if d: self.day_input.setText(d)
-        if desc: self.desc_input.setText(desc)
-        
+        if y:
+            self.year_input.setText(y)
+        if m:
+            self.month_input.setText(m)
+        if d:
+            self.day_input.setText(d)
+        if desc:
+            self.desc_input.setText(desc)
+
         self.desc_input.setFocus()
 
     def process_and_next(self):
