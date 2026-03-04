@@ -3,6 +3,7 @@ import os
 import sys
 import time
 import yaml
+import html
 from pathlib import Path
 from platformdirs import user_config_dir
 from PyQt5.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout,
@@ -74,16 +75,14 @@ class ImageTask:
 
 class ProcessorThread(QThread):
     log_signal = pyqtSignal(str)
-    # Signal to tell UI a specific file is finished
     finished_file_signal = pyqtSignal(str)
-    # Preview: (webp_path, image_bytes, y, m, d, description) so UI can show from memory
     preview_ready_signal = pyqtSignal(str, bytes, str, str, str, str) 
 
     def __init__(self):
         super().__init__()
         self.task_queue = queue.Queue()
         self.running = True
-        self.in_progress = set() # Track active paths
+        self.in_progress = set()
 
     def add_task(self, task):
         self.in_progress.add(os.path.abspath(task.file_path))
@@ -94,7 +93,6 @@ class ProcessorThread(QThread):
             try:
                 task = self.task_queue.get(timeout=1)
                 self.process_image(task)
-                # Remove from set and notify UI
                 path = os.path.abspath(task.file_path)
                 if path in self.in_progress:
                     self.in_progress.remove(path)
@@ -103,9 +101,6 @@ class ProcessorThread(QThread):
                 continue
 
     def process_image(self, task):
-        # Load into an in-memory copy so the original file handle is released immediately.
-        # This avoids PermissionError when deleting the source (e.g. if user clicks Back
-        # or another process has the file open).
         with Image.open(task.file_path) as opened:
             img = opened.copy()
         img = ImageOps.exif_transpose(img)
@@ -113,17 +108,20 @@ class ProcessorThread(QThread):
         if task.rotation != 0:
             img = img.rotate(task.rotation, expand=True)
 
+        # Prepare EXIF for files
         exif_dict = {"0th": {}, "Exif": {}, "1st": {}, "thumbnail": None, "GPS": {}}
-        exif_date = f"{task.y if task.y else '1900'}:{task.m.zfill(2) if task.m else '01'}:{task.d.zfill(2) if task.d else '01'} 12:00:00"
-        exif_dict['0th'][piexif.ImageIFD.DateTime] = exif_date
-        exif_dict['Exif'][piexif.ExifIFD.DateTimeOriginal] = exif_date
+        formatted_date = f"{task.y if task.y else '1900'}:{task.m.zfill(2) if task.m else '01'}:{task.d.zfill(2) if task.d else '01'}"
+        exif_full_date = f"{formatted_date} 12:00:00"
+        
+        exif_dict['0th'][piexif.ImageIFD.DateTime] = exif_full_date
+        exif_dict['Exif'][piexif.ExifIFD.DateTimeOriginal] = exif_full_date
 
         if task.description:
             exif_dict['0th'][piexif.ImageIFD.ImageDescription] = task.description.encode('utf-8')
 
         exif_bytes = piexif.dump(exif_dict)
 
-        # Send preview to UI so it can show this image from memory (no disk read while saving)
+        # Send preview to UI
         new_webp_path = os.path.join(task.folder_path, task.new_webp_name)
         buf = io.BytesIO()
         img.save(buf, "PNG")
@@ -136,38 +134,100 @@ class ProcessorThread(QThread):
             task.description or "",
         )
 
+        # Clean up existing files in processed folder
         if os.path.exists(task.output_folder):
             for existing_file in os.listdir(task.output_folder):
                 name_part, _ = os.path.splitext(existing_file)
                 if name_part == task.base_name:
                     try:
                         os.remove(os.path.join(task.output_folder, existing_file))
-                        self.log_signal.emit(f"DELETED existing: {existing_file}")
                     except: pass
 
+        # 1. SAVE LOSSLESS TO ROOT
         img.save(new_webp_path, "WEBP", lossless=True, method=6, exif=exif_bytes)
         self.log_signal.emit(f"SAVED (Lossless): {task.new_webp_name}")
 
+        # 2. SAVE LOSSY TO PROCESSED/
         lossy_path = os.path.join(task.output_folder, task.new_webp_name)
         img.convert("RGB").save(lossy_path, "WEBP", quality=90, method=6, exif=exif_bytes)
         self.log_signal.emit(f"SAVED (Lossy): {task.new_webp_name} to processed/")
 
+        # 3. SAVE XMP SIDECAR TO PROCESSED/ ONLY
+        # Standard XMP format that Immich/Lightroom can read
+        xmp_path = lossy_path + ".xmp"
+        xmp_desc = task.description if task.description else ""
+        # Convert date to ISO format
+        iso_date = formatted_date.replace(":", "-")
+        xmp_desc = task.description if task.description else ""
+        
+        # Defaulting to 12:00:00Z (UTC) to prevent local-time shifting.
+        # Escape special characters like & < > "
+        safe_desc = html.escape(task.description if task.description else "")
+        iso_date = formatted_date.replace(":", "-")
+        
+        xmp_template = f"""<?xml version="1.0" encoding="UTF-8"?>
+        <x:xmpmeta xmlns:x="adobe:ns:meta/" x:xmptk="XMP Core 5.6.0">
+         <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+          <rdf:Description rdf:about=""
+            xmlns:dc="http://purl.org/dc/elements/1.1/"
+            xmlns:exif="http://ns.adobe.com/exif/1.0/"
+            xmlns:tiff="http://ns.adobe.com/tiff/1.0/"
+            xmlns:xmp="http://ns.adobe.com/xap/1.0/"
+            xmlns:lr="http://ns.adobe.com/lightroom/1.0/"
+            xmlns:digiKam="http://www.digikam.org/ns/1.0/">
+           
+           <dc:title>
+            <rdf:Alt>
+             <rdf:li xml:lang="x-default">{safe_desc}</rdf:li>
+            </rdf:Alt>
+           </dc:title>
+           <dc:description>
+            <rdf:Alt>
+             <rdf:li xml:lang="x-default">{safe_desc}</rdf:li>
+            </rdf:Alt>
+           </dc:description>
+           <tiff:ImageDescription>{safe_desc}</tiff:ImageDescription>
+           
+           <exif:DateTimeOriginal>{iso_date}T12:00:00</exif:DateTimeOriginal>
+           <xmp:CreateDate>{iso_date}T12:00:00</xmp:CreateDate>
+           <xmp:ModifyDate>{iso_date}T12:00:00</xmp:ModifyDate>
+           
+           <tiff:Orientation>1</tiff:Orientation>
+           <xmp:Rating>0</xmp:Rating>
+           
+           <dc:subject>
+            <rdf:Bag/>
+           </dc:subject>
+           <lr:HierarchicalSubject>
+            <rdf:Bag/>
+           </lr:HierarchicalSubject>
+           <digiKam:TagsList>
+            <rdf:Bag/>
+           </digiKam:TagsList>
+           
+          </rdf:Description>
+         </rdf:RDF>
+        </x:xmpmeta>"""
+
+        try:
+            with open(xmp_path, "w", encoding="utf-8") as xf:
+                xf.write(xmp_template)
+            self.log_signal.emit(f"SAVED Sidecar: {os.path.basename(xmp_path)}")
+        except Exception as e:
+            self.log_signal.emit(f"XMP Error: {e}")
+
         img.close()
 
-        # Delete source only if it's a different path. Retry a few times on Windows
-        # in case another process (e.g. UI, antivirus) still has the file open.
+        # Delete source logic
         if os.path.abspath(task.file_path) != os.path.abspath(new_webp_path):
             for attempt in range(3):
                 try:
                     os.remove(task.file_path)
                     break
                 except PermissionError:
-                    if attempt < 2:
-                        time.sleep(0.25)
-                    else:
-                        self.log_signal.emit(f"Could not delete original (in use): {os.path.basename(task.file_path)}")
-
-
+                    if attempt < 2: time.sleep(0.25)
+                    
+                    
 class PhotoViewer(QGraphicsView):
     def __init__(self, parent=None):
         super().__init__(parent)
