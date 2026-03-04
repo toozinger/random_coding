@@ -155,10 +155,8 @@ class ProcessorThread(QThread):
         # 3. SAVE XMP SIDECAR TO PROCESSED/ ONLY
         # Standard XMP format that Immich/Lightroom can read
         xmp_path = lossy_path + ".xmp"
-        xmp_desc = task.description if task.description else ""
         # Convert date to ISO format
         iso_date = formatted_date.replace(":", "-")
-        xmp_desc = task.description if task.description else ""
         
         # Defaulting to 12:00:00Z (UTC) to prevent local-time shifting.
         # Escape special characters like & < > "
@@ -212,7 +210,8 @@ class ProcessorThread(QThread):
         try:
             with open(xmp_path, "w", encoding="utf-8") as xf:
                 xf.write(xmp_template)
-            self.log_signal.emit(f"SAVED Sidecar: {os.path.basename(xmp_path)}")
+            if self.receivers(self.log_signal) > 0:
+                self.log_signal.emit(f"SAVED Sidecar: {os.path.basename(xmp_path)}")
         except Exception as e:
             self.log_signal.emit(f"XMP Error: {e}")
 

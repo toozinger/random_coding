@@ -2,9 +2,11 @@ import os
 from tqdm import tqdm
 from concurrent.futures import ProcessPoolExecutor
 from exif_modify import ImageTask, ProcessorThread, get_existing_metadata
+from PyQt5.QtCore import QCoreApplication
+import sys
 
 # --- Configuration ---
-ROOT_FOLDER = r"G:\My Drive\Documents\Media\Scanned Photos"
+ROOT_FOLDER = r"C:\Users\toozi\Downloads\2007"
 VALID_EXTENSIONS = ('.jpg', '.jpeg', '.tiff', '.bmp', '.png', '.webp')
 # Use 12 of your 14 threads to keep the system responsive
 MAX_WORKERS = 12 
@@ -64,4 +66,6 @@ def run_headless_batch():
 
 if __name__ == "__main__":
 
+    # Creates a non-GUI app instance so QThreads/Signals don't crash
+    app = QCoreApplication(sys.argv) 
     run_headless_batch()
